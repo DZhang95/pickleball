@@ -1,0 +1,54 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    urlcolor=blue,
+    linkcolor=blue,
+    citecolor=red
+}
+
+\title{Pickleball Flight}
+\author{Maxwell Feng, Daniel Zhang\\Website: \href{https://dzhang95.github.io/pickleball/}{https://dzhang95.github.io/pickleball/}}
+\date{November 17th 2025}
+
+\begin{document}
+
+\maketitle
+
+\newpage
+\section{Summary}
+We want to simulate the path of a pickleball as it flies through the air and bounces off the ground. Our project will factor in the spin of the ball and contact with air particles, but will not simulate the paddles. We will also provide simple graphics for the pickleball, but the focus of the project is on calculating the flight of the pickleball.
+
+\section{Background}
+For our project we need to track the position and velocity for every air particle and the pickleball. In addition, we will need to track the spin of the pickleball as well. Every timestep, for every object, we will need to determine what it collides with and how that affects it. There will be a lot of computations and data updates every single time step, which is where we will explore opportunities for parallelism. 
+
+\section{Challenge}
+%TODO - Add more
+Determining the effect of collisions may be challenging, as it depends on position of impact and the spin of the ball.
+
+\section{Resources}
+%TODO - Go over?
+For the code, we will may reuse parts of the CUDA assignment. More specifically, we may reuse the rendering components to actually display our simulation. We also plan on looking up an online resource to guide us on how we should calculate the effect of air particles colliding on a spinning pickleball.
+
+\section{Goals}
+\begin{itemize}
+\item \textbf{50\%} - No simulation of air particles, just "determine" how many particles impact the ball at every timestep and focus on tracking just the ball. The ball is smooth with no holes.
+\item \textbf{100\%} - Add in simulation and tracking of air particles. The particles impacting the ball will no longer be arbitrarily decided, it will instead depend on the position of air particles. Air particles will not impact other air particles. 
+\item \textbf{150\%} - Allow air particles to impact other air particles.
+\item \textbf{200\%} - Add holes into the pickleball!
+\end{itemize}
+
+\section{Platform}
+%TODO - Verify, idk if GPU will be good?
+We plan on using the GHC machines and C++. The GHC machines are convenient and have a nice GPU that can be used for arithmetic intensive portions if needed. C++ will allow us to use CUDA to make use of the GPU.
+
+\section{Schedule}
+%TODO - double-check
+\begin{itemize}
+\item \textbf{Nov 17 - Nov 23} - Build scaffolding/skeleton in the code base needed to support development. Determine how we are going to render our final results. Determine the formula for how we will calculate the physics of the pickleball and air particles. Determine how we will evaluate the "quality" of our simulation, if possible. Begin development on the 50\% goal. Stretch - finish the 50\% goal.
+\item \textbf{Nov 24 - Nov 30} - Finish the 50\% goal. Start and finish the 100\% goal. Begin the report.
+\item \textbf{Dec 1 - Dec 8} - Finish the 100\% goal. Add in and collect timing information and other various metrics. Finish the report. Take a stab at the remaining goals.
+\end{itemize}
+
+\end{document}
