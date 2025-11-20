@@ -1,0 +1,82 @@
+General approach
+Start w/ initial velocity and spin (angular velocity) for ball
+Calculate the initial impulse of the ball
+Calculate collisions
+For each collision, calculate the impulse of the impact on the ball
+Sum up the impulses
+Calculate the new veloctiy and spin of the ball
+
+Gravity not considered for 2D implementation
+
+Calculation for impact of collisions on the ball:
+Definitions:
+
+    M: Ball mass (0.026 kg)
+
+    m: Air particle mass (0.0001 kg)
+
+    R: Ball radius
+
+    v_ball: Velocity of the ball's center (vector)
+
+    ω: Angular velocity (spin) of the ball (vector)
+
+    u_air: Velocity of the air particle (vector). For still air, this is (0, 0, 0).
+
+    r: Vector from the ball's center to the collision point. Its magnitude is R.
+
+    n: Unit normal vector at the collision point = r / R.
+    
+Calculate surface veloctiy at point of impact:
+v_surface = v_ball + (ω × r)
+Calculate Relative Velocity:
+v_rel = u_air - v_surface
+Calculate Impulse for one collision:
+J = 2 * m * dot(v_rel, n) * n
+Aggregate impulses of all collisions by adding them. Then update ball state:
+New Linear Velocity: 
+v_ball_new = v_ball + (J / M)
+New Angular Velocity: 
+ω_new = ω + (cross(r, J) / I)
+Moment of Inertia (I): 
+I = (2/5) * M * R²
+
+pickleball court dimensions
+Width: 20 ft × 0.3048 = 6.096 m
+Length: 44 ft × 0.3048 = 13.4112 m
+Height: 10 ft × 0.3048 = 3.048 m
+granularity: 1 cm -> about 249 million cells
+
+Ball is 26g
+Ball diameter is 74mm
+Air particles are not calculated individually, they are instead simulated as "parcels" of air.
+Air parcels are 0.1g
+3 million air parcels in the court?
+
+
+expected collisions second = (ρ × A × v) / m_air
+where A is the cross-sectional area of the ball (A=πR^2), R=0.037 (radius from diameter 74 mm), and v is the ball's speed.
+~526 collisions per second when v = 10 m/s
+time step = 0.001s
+
+
+
+
+
+
+Collision Statistics & Poisson Distribution:
+
+    Bird, G. A. "Molecular Gas Dynamics and the Direct Simulation of Gas Flows." Oxford University Press. This is the foundational text for DSMC (Direct Simulation Monte Carlo) methods, which exactly handle the statistical nature of molecular collisions.
+    
+Pickleball Court Dimensions: Official rules from the USA Pickleball Association specify a court size of 20 ft × 44 ft. USA Pickleball
+Normal Vectors in Physics:
+
+    Marion, J. B., & Thornton, S. T. "Classical Dynamics of Particles and Systems." Brooks/Cole. Use of normal vectors in collision physics.
+
+Impulse-Momentum Theorem:
+
+    Halliday, D., Resnick, R., & Walker, J. "Fundamentals of Physics." Wiley. The relationship between impulse and momentum change.
+
+Elastic Collision Mathematics:
+
+    Goldstein, H., Poole, C., & Safko, J. "Classical Mechanics." Addison-Wesley. Derivation of collision dynamics and the coefficient of restitution (which is 1 for perfect elasticity).
