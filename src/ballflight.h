@@ -6,7 +6,7 @@ struct Vec2 {
 };
 
 // All global simulation variables
-struct World {
+struct SimulationParameters {
     double timestepSize; // seconds
     double totalTime; // seconds
     int mode;
