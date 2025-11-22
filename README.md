@@ -13,4 +13,4 @@ ballflight usage
 -p: Number of millions of air parcels, default 3
 
 
-[-t timestep_size] [-T total_time] -v ball_velocity -w ball_spin -a mode -p [air_parcel_count]
+[-t timestep_size] [-T total_time] [-v ball_velocity] [-w ball_spin] [-a mode] [-p air_parcel_count]
