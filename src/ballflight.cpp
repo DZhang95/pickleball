@@ -4,18 +4,30 @@
 #include <string>
 #include <iostream>
 #include <vector>
+#include <cstdint>
+#include <cassert>
 
 #include "ballflight.h"
 
-float ballVelocityX;
-float ballVelocityY;
+//float ballVelocityX;
+//float ballVelocityY;
 //float ballVelocityZ; // For 3d
-float ballSpinX;
-float ballSpinY;
+Vec2 ballVelocity;
+//float ballSpinX;
+//float ballSpinY;
 //float ballSpinZ; // For 3d
+Vec2 ballSpin;
 double currentTime; // seconds
 std::vector<std::vector<Location>> grid;
 
+// helper to produce canonical 64-bit key
+static inline uint64_t make_pair_key(int a, int b) {
+    assert(a >= 0 && b >= 0); // ensure non-negative IDs, or add offset
+    uint32_t ua = static_cast<uint32_t>(a);
+    uint32_t ub = static_cast<uint32_t>(b);
+    if (ua > ub) std::swap(ua, ub);
+    return (static_cast<uint64_t>(ua) << 32) | static_cast<uint64_t>(ub);
+};
 
 // Initialize the world
 // Create all objects (air parcels and ball) and place them in the grid
