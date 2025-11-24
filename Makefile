@@ -18,7 +18,12 @@ RENDERER_SRC := $(SRC_DIR)/renderer.cpp
 RENDERER_OBJ := $(BUILD_DIR)/renderer.o
 
 # OpenGL libraries - using pkg-config for GLFW
+ifeq ($(shell uname -s),Darwin)
 LDFLAGS_GLFW := $(shell pkg-config --libs glfw3) -framework OpenGL
+else
+LDFLAGS_GLFW := $(shell pkg-config --libs glfw3) -lGLEW -lGL -ldl
+RENDERER_CXXFLAGS += $(shell pkg-config --cflags glew)
+endif
 RENDERER_CXXFLAGS += $(shell pkg-config --cflags glfw3)
 
 # Use regular g++ for renderer (not mpic++)

@@ -1,6 +1,10 @@
 #define GL_SILENCE_DEPRECATION
 #define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl3.h>
+#ifdef __APPLE__
+  #include <OpenGL/gl3.h>
+#else
+  #include <GL/glew.h>
+#endif
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <cstdlib>
@@ -266,6 +270,14 @@ int main() {
     }
     
     glfwMakeContextCurrent(window);
+#ifndef __APPLE__
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK) {
+        std::cerr << "Failed to initialize GLEW" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+#endif    
     
     // Create shader program for rectangle
     unsigned int shaderProgram = createShaderProgram();
