@@ -231,6 +231,16 @@ void renderNet(float centerX, float topY, float bottomY, float lineWidth) {
     glDeleteVertexArrays(1, &VAO);
 }
 
+// Air particle structure (designed for future upgrade to realistic physics)
+struct AirParticle {
+    float x, y;           // Position
+    float velX, velY;      // Velocity
+    float mass;            // Mass (for future realistic physics)
+    
+    AirParticle(float px, float py, float vx, float vy, float m) 
+        : x(px), y(py), velX(vx), velY(vy), mass(m) {}
+};
+
 int main() {
     // Initialize GLFW
     if (!glfwInit()) {
@@ -353,22 +363,27 @@ int main() {
     float rectHalfWidth = 1.5f / 2.0f;  // 0.75
     float rectHalfHeight = 1.3f / 2.0f;  // 0.65
     
-    // Generate air particles (static, small circles)
+    // Generate air particles (now with velocities for collision response)
     const int numAirParticles = 1000;
     float airParticleRadius = 0.02f;  // Much smaller than the ball
-    std::vector<std::pair<float, float> > airParticles;
+    float ballMass = 1.0f;              // Ball mass (normalized)
+    float particleMass = 0.01f;        // Air particle mass (much lighter)
+    std::vector<AirParticle> airParticles;
     
     // Random number generator for positioning air particles
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> xDist(-rectHalfWidth + airParticleRadius, rectHalfWidth - airParticleRadius);
     std::uniform_real_distribution<float> yDist(-rectHalfHeight + airParticleRadius, rectHalfHeight - airParticleRadius);
+    std::uniform_real_distribution<float> velDist(-0.0001f, 0.0001f);  // Small random initial velocities
     
-    // Generate random positions for air particles within the court
+    // Generate random positions and velocities for air particles within the court
     for (int i = 0; i < numAirParticles; i++) {
         float x = xDist(gen);
         float y = yDist(gen);
-        airParticles.push_back(std::make_pair(x, y));
+        float vx = velDist(gen);
+        float vy = velDist(gen);
+        airParticles.push_back(AirParticle(x, y, vx, vy, particleMass));
     }
     
     // Circle physics variables
@@ -380,11 +395,71 @@ int main() {
     
     // Main render loop
     while (!glfwWindowShouldClose(window)) {
-        // Update circle position
+        // Update ball position
         circleX += circleVelX;
         circleY += circleVelY;
         
-        // Check for collisions with rectangle boundaries and bounce
+        // Update air particle positions
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            airParticles[i].x += airParticles[i].velX;
+            airParticles[i].y += airParticles[i].velY;
+        }
+        
+        // Check for collisions between ball and air particles
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            AirParticle& particle = airParticles[i];
+            
+            // Calculate distance between ball and particle centers
+            float dx = circleX - particle.x;
+            float dy = circleY - particle.y;
+            float distance = sqrtf(dx * dx + dy * dy);
+            float minDistance = circleRadius + airParticleRadius;
+            
+            if (distance < minDistance && distance > 0.0001f) {  // Collision detected
+                // Normalize collision vector
+                float nx = dx / distance;
+                float ny = dy / distance;
+                
+                // Separate overlapping objects
+                float overlap = minDistance - distance;
+                float separationX = nx * overlap * 0.5f;
+                float separationY = ny * overlap * 0.5f;
+                
+                // Push objects apart (proportional to mass for future realistic physics)
+                float totalMass = ballMass + particle.mass;
+                circleX += separationX * (particle.mass / totalMass);
+                circleY += separationY * (particle.mass / totalMass);
+                particle.x -= separationX * (ballMass / totalMass);
+                particle.y -= separationY * (ballMass / totalMass);
+                
+                // Calculate relative velocity
+                float relVelX = circleVelX - particle.velX;
+                float relVelY = circleVelY - particle.velY;
+                
+                // Calculate relative velocity along collision normal
+                float velAlongNormal = relVelX * nx + relVelY * ny;
+                
+                // Don't resolve if velocities are separating
+                if (velAlongNormal > 0) continue;
+                
+                // Calculate impulse scalar (elastic collision)
+                // For future: can add restitution coefficient here
+                float restitution = 1.0f;  // Perfectly elastic for now
+                float impulseScalar = -(1.0f + restitution) * velAlongNormal;
+                impulseScalar /= (1.0f / ballMass + 1.0f / particle.mass);
+                
+                // Apply impulse
+                float impulseX = impulseScalar * nx;
+                float impulseY = impulseScalar * ny;
+                
+                circleVelX += impulseX / ballMass;
+                circleVelY += impulseY / ballMass;
+                particle.velX -= impulseX / particle.mass;
+                particle.velY -= impulseY / particle.mass;
+            }
+        }
+        
+        // Check for collisions with rectangle boundaries and bounce (ball)
         // Left boundary
         if (circleX - circleRadius <= -rectHalfWidth) {
             circleX = -rectHalfWidth + circleRadius;
@@ -406,6 +481,32 @@ int main() {
             circleVelY = -circleVelY;
         }
         
+        // Check for collisions with rectangle boundaries (air particles)
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            AirParticle& particle = airParticles[i];
+            
+            // Left boundary
+            if (particle.x - airParticleRadius <= -rectHalfWidth) {
+                particle.x = -rectHalfWidth + airParticleRadius;
+                particle.velX = -particle.velX;
+            }
+            // Right boundary
+            if (particle.x + airParticleRadius >= rectHalfWidth) {
+                particle.x = rectHalfWidth - airParticleRadius;
+                particle.velX = -particle.velX;
+            }
+            // Bottom boundary
+            if (particle.y - airParticleRadius <= -rectHalfHeight) {
+                particle.y = -rectHalfHeight + airParticleRadius;
+                particle.velY = -particle.velY;
+            }
+            // Top boundary
+            if (particle.y + airParticleRadius >= rectHalfHeight) {
+                particle.y = rectHalfHeight - airParticleRadius;
+                particle.velY = -particle.velY;
+            }
+        }
+        
         // Clear the screen
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
         glClear(GL_COLOR_BUFFER_BIT);
@@ -419,10 +520,10 @@ int main() {
         glUseProgram(netShaderProgram);
         renderNet(0.0f, rectHalfHeight, -rectHalfHeight, 0.01f); // Center x=0, full height, thin line
         
-        // Render air particles (static, small circles)
+        // Render air particles (now moving, small circles)
         glUseProgram(airParticleShaderProgram);
         for (size_t i = 0; i < airParticles.size(); i++) {
-            renderCircle(airParticles[i].first, airParticles[i].second, airParticleRadius, 16);
+            renderCircle(airParticles[i].x, airParticles[i].y, airParticleRadius, 16);
         }
         
         // Render a circle (ball) inside the rectangle at its current position
