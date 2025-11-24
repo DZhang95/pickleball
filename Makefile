@@ -10,7 +10,9 @@ BIN_DIR := bin
 TARGET := $(BIN_DIR)/ballflight
 RENDERER_TARGET := $(BIN_DIR)/renderer
 
-SRCS := $(wildcard $(SRC_DIR)/*.cpp)
+# Get all .cpp files except renderer.cpp for ballflight target
+ALL_SRCS := $(wildcard $(SRC_DIR)/*.cpp)
+SRCS := $(filter-out $(SRC_DIR)/renderer.cpp,$(ALL_SRCS))
 OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 RENDERER_SRC := $(SRC_DIR)/renderer.cpp
 RENDERER_OBJ := $(BUILD_DIR)/renderer.o
