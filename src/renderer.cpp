@@ -376,10 +376,31 @@ int main() {
     float rectHalfHeight = 1.3f / 2.0f;  // 0.65
     
     // Generate air particles (now with velocities for collision response)
-    const int numAirParticles = 1000;
-    float airParticleRadius = 0.02f;  // Much smaller than the ball
-    float ballMass = 1.0f;              // Ball mass (normalized)
-    float particleMass = 0.01f;        // Air particle mass (much lighter)
+    const int numAirParticles = 2000;
+    
+    // Physics constants
+    const float BALL_MASS = 0.026f;  // kg (26g)
+    const float AIR_PARCEL_MASS = 0.0001f;  // kg (0.1g) - represents many air molecules
+    const float BALL_RADIUS = 0.185f;  // m (74mm diameter / 2)
+    const float BALL_MOMENT_OF_INERTIA = (2.0f / 5.0f) * BALL_MASS * BALL_RADIUS * BALL_RADIUS;
+    
+    // Air particle size: much smaller than ball for realistic scale
+    // In reality, air molecules are nanometers, but for visualization we make them visible
+    // The effective collision radius should be much smaller than the ball
+    float airParticleRadius = 0.005f;  // 1mm - much smaller than ball (37mm radius)
+    
+    // Scale factor for impulse: each air parcel represents many molecules
+    // In reality, ~526 collisions/second at 10 m/s, but we have fewer parcels
+    // So we scale down the impulse to account for the fact that each parcel
+    // represents many individual collisions that should be averaged
+    // This is a simplification - ideally we'd use statistical methods
+    const float IMPULSE_SCALE_FACTOR = 0.01f;  // Scale down impulses by 100x
+    
+    // Use proper physics constants
+    float ballMass = BALL_MASS;
+    float particleMass = AIR_PARCEL_MASS;
+    float circleRadius = BALL_RADIUS;  // Use actual ball radius
+    
     std::vector<AirParticle> airParticles;
     
     // Random number generator for positioning air particles
@@ -387,7 +408,9 @@ int main() {
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> xDist(-rectHalfWidth + airParticleRadius, rectHalfWidth - airParticleRadius);
     std::uniform_real_distribution<float> yDist(-rectHalfHeight + airParticleRadius, rectHalfHeight - airParticleRadius);
-    std::uniform_real_distribution<float> velDist(-0.0001f, 0.0001f);  // Small random initial velocities
+    // For still air, particles should have near-zero velocity
+    // They only move due to collisions with the ball
+    std::uniform_real_distribution<float> velDist(-0.00001f, 0.00001f);  // Very small random initial velocities (still air)
     
     // Generate random positions and velocities for air particles within the court
     for (int i = 0; i < numAirParticles; i++) {
@@ -401,71 +424,145 @@ int main() {
     // Circle physics variables
     float circleX = 0.0f;
     float circleY = 0.0f;
-    float circleRadius = 0.1f;
-    float circleVelX = 0.01f;  // Velocity in x direction
-    float circleVelY = 0.005f;   // Velocity in y direction
+    // circleRadius is now set above from BALL_RADIUS
+    float circleVelX = 10.0f;  // Velocity in x direction
+    float circleVelY = 10.0f;   // Velocity in y direction
+    float circleSpin = 0.0f;  // Angular velocity (spin) - scalar in 2D
     
     // Main render loop
+    const float timestep = 0.001f;  // 0.001s time step (from physics.txt)
     while (!glfwWindowShouldClose(window)) {
-        // Update ball position
-        circleX += circleVelX;
-        circleY += circleVelY;
+        // Update ball position based on velocity
+        circleX += circleVelX * timestep;
+        circleY += circleVelY * timestep;
         
         // Update air particle positions
         for (size_t i = 0; i < airParticles.size(); i++) {
-            airParticles[i].x += airParticles[i].velX;
-            airParticles[i].y += airParticles[i].velY;
+            airParticles[i].x += airParticles[i].velX * timestep;
+            airParticles[i].y += airParticles[i].velY * timestep;
+        }
+        
+        // Check for collisions between air particles (AIR-AIR collisions)
+        // Using impulse-based physics: calculate relative velocity and impulse
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            for (size_t j = i + 1; j < airParticles.size(); j++) {
+                AirParticle& particle1 = airParticles[i];
+                AirParticle& particle2 = airParticles[j];
+                
+                // Calculate distance between particle centers
+                float dx = particle2.x - particle1.x;
+                float dy = particle2.y - particle1.y;
+                float distance = sqrtf(dx * dx + dy * dy);
+                float minDistance = 2.0f * airParticleRadius;  // Both particles have same radius
+                
+                if (distance < minDistance && distance > 0.0001f) {  // Collision detected
+                    // Normalize collision vector (from particle1 to particle2)
+                    std::cout << "collision" << std::endl;
+                    float nx = dx / distance;  // Unit normal n
+                    float ny = dy / distance;
+                    
+                    // Separate overlapping particles
+                    float overlap = minDistance - distance;
+                    float separationX = nx * overlap * 0.5f;
+                    float separationY = ny * overlap * 0.5f;
+                    
+                    // Push particles apart (equal mass, so equal separation)
+                    particle1.x -= separationX;
+                    particle1.y -= separationY;
+                    particle2.x += separationX;
+                    particle2.y += separationY;
+                    
+                    // Calculate relative velocity: v_rel = v2 - v1
+                    float relVelX = particle2.velX - particle1.velX;
+                    float relVelY = particle2.velY - particle1.velY;
+                    
+                    // Calculate impulse: J = 2 * m * dot(v_rel, n) * n
+                    // For air-air collisions, both particles have mass m = AIR_PARCEL_MASS
+                    float v_rel_dot_n = relVelX * nx + relVelY * ny;
+                    float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
+                    float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
+                    
+                    // Scale down impulse for air-air collisions (they're less important)
+                    impulseX *= IMPULSE_SCALE_FACTOR;
+                    impulseY *= IMPULSE_SCALE_FACTOR;
+                    
+                    // Update velocities: v_new = v + (J / m)
+                    // Particle 1 gets +J/m (in direction of n)
+                    // Particle 2 gets -J/m (opposite direction)
+                    particle1.velX += impulseX / AIR_PARCEL_MASS;
+                    particle1.velY += impulseY / AIR_PARCEL_MASS;
+                    particle2.velX -= impulseX / AIR_PARCEL_MASS;
+                    particle2.velY -= impulseY / AIR_PARCEL_MASS;
+                }
+            }
         }
         
         // Check for collisions between ball and air particles
+        // Using the physics model: calculate surface velocity, relative velocity, and impulse
         for (size_t i = 0; i < airParticles.size(); i++) {
             AirParticle& particle = airParticles[i];
             
             // Calculate distance between ball and particle centers
-            float dx = circleX - particle.x;
-            float dy = circleY - particle.y;
+            float dx = particle.x - circleX;  // Vector from ball to particle
+            float dy = particle.y - circleY;
             float distance = sqrtf(dx * dx + dy * dy);
             float minDistance = circleRadius + airParticleRadius;
             
             if (distance < minDistance && distance > 0.0001f) {  // Collision detected
-                // Normalize collision vector
-                float nx = dx / distance;
-                float ny = dy / distance;
+                // Normalize collision vector (r: from ball center to collision point)
+                float r_mag = sqrtf(dx * dx + dy * dy);
+                float nx = dx / r_mag;  // Unit normal n = r / |r|
+                float ny = dy / r_mag;
+                
+                // r vector with magnitude R (ball radius) pointing to collision point
+                float rx = nx * circleRadius;
+                float ry = ny * circleRadius;
                 
                 // Separate overlapping objects
                 float overlap = minDistance - distance;
                 float separationX = nx * overlap * 0.5f;
                 float separationY = ny * overlap * 0.5f;
                 
-                // Push objects apart (proportional to mass for future realistic physics)
+                // Push objects apart (proportional to mass)
                 float totalMass = ballMass + particle.mass;
-                circleX += separationX * (particle.mass / totalMass);
-                circleY += separationY * (particle.mass / totalMass);
-                particle.x -= separationX * (ballMass / totalMass);
-                particle.y -= separationY * (ballMass / totalMass);
+                circleX -= separationX * (particle.mass / totalMass);
+                circleY -= separationY * (particle.mass / totalMass);
+                particle.x += separationX * (ballMass / totalMass);
+                particle.y += separationY * (ballMass / totalMass);
                 
-                // Calculate relative velocity
-                float relVelX = circleVelX - particle.velX;
-                float relVelY = circleVelY - particle.velY;
+                // Calculate surface velocity at point of impact: v_surface = v_ball + (ω × r)
+                // In 2D: ω × r = (-ω * r.y, ω * r.x) where ω is scalar angular velocity
+                float surfaceVelX = circleVelX - circleSpin * ry;
+                float surfaceVelY = circleVelY + circleSpin * rx;
                 
-                // Calculate relative velocity along collision normal
-                float velAlongNormal = relVelX * nx + relVelY * ny;
+                // Calculate relative velocity: v_rel = u_air - v_surface
+                float relVelX = particle.velX - surfaceVelX;
+                float relVelY = particle.velY - surfaceVelY;
                 
-                // Don't resolve if velocities are separating
-                if (velAlongNormal > 0) continue;
+                // Calculate impulse: J = 2 * m * dot(v_rel, n) * n
+                float v_rel_dot_n = relVelX * nx + relVelY * ny;
+                float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
+                float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
                 
-                // Calculate impulse scalar (elastic collision)
-                // For future: can add restitution coefficient here
-                float restitution = 1.0f;  // Perfectly elastic for now
-                float impulseScalar = -(1.0f + restitution) * velAlongNormal;
-                impulseScalar /= (1.0f / ballMass + 1.0f / particle.mass);
+                // Scale down impulse: each air parcel represents many molecules
+                // In reality, there are billions of tiny collisions that average out
+                // Since we have fewer, larger parcels, we scale down the effect
+                impulseX *= IMPULSE_SCALE_FACTOR;
+                impulseY *= IMPULSE_SCALE_FACTOR;
                 
-                // Apply impulse
-                float impulseX = impulseScalar * nx;
-                float impulseY = impulseScalar * ny;
-                
+                // Update ball linear velocity: v_ball_new = v_ball + (J / M)
                 circleVelX += impulseX / ballMass;
                 circleVelY += impulseY / ballMass;
+                
+                // Update ball angular velocity: ω_new = ω + (cross(r, J) / I)
+                // In 2D: cross(r, J) = r.x * J.y - r.y * J.x (scalar)
+                // Note: spin change already uses the scaled impulse, so it's automatically scaled
+                float r_cross_J = rx * impulseY - ry * impulseX;
+                float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
+                circleSpin += spin_change;
+                
+                // Update air particle velocity (for still air, this would be minimal)
+                // For now, we'll apply the impulse to the particle as well
                 particle.velX -= impulseX / particle.mass;
                 particle.velY -= impulseY / particle.mass;
             }
