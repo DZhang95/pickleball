@@ -376,7 +376,7 @@ int main() {
     float rectHalfHeight = 1.3f / 2.0f;  // 0.65
     
     // Generate air particles (now with velocities for collision response)
-    const int numAirParticles = 5000;
+    const int numAirParticles = 3000;
     
     // Physics constants
     const float BALL_MASS = 0.026f;  // kg (26g)
@@ -387,11 +387,12 @@ int main() {
     float airParticleRadius = 0.005f;
     
     const float IMPULSE_SCALE_FACTOR = 0.01f;  // Scale down impulses by 100x
+    const float AIR_AIR_IMPULSE_SCALE_FACTOR = 0.1f;
     
     // Wind parameters (wind velocity in m/s)
     // Set these to non-zero values to simulate wind
     // For still air, set both to 0.0f
-    const float WIND_VELOCITY_X = 2.0f;  // Wind speed in x direction (m/s)
+    const float WIND_VELOCITY_X = 0.0f;  // Wind speed in x direction (m/s)
     const float WIND_VELOCITY_Y = 0.0f;  // Wind speed in y direction (m/s)
     // Wind turbulence: small random variations in wind speed
     const float WIND_TURBULENCE = 0.1f;  // Random variation as fraction of wind speed
@@ -500,8 +501,8 @@ int main() {
                     float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
                     
                     // Scale down impulse for air-air collisions (they're less important)
-                    impulseX *= IMPULSE_SCALE_FACTOR;
-                    impulseY *= IMPULSE_SCALE_FACTOR;
+                    impulseX *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+                    impulseY *= AIR_AIR_IMPULSE_SCALE_FACTOR;
                     
                     // Update velocities: v_new = v + (J / m)
                     // Particle 1 gets +J/m (in direction of n)
