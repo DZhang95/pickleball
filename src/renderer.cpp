@@ -376,25 +376,25 @@ int main() {
     float rectHalfHeight = 1.3f / 2.0f;  // 0.65
     
     // Generate air particles (now with velocities for collision response)
-    const int numAirParticles = 2000;
+    const int numAirParticles = 5000;
     
     // Physics constants
     const float BALL_MASS = 0.026f;  // kg (26g)
     const float AIR_PARCEL_MASS = 0.0001f;  // kg (0.1g) - represents many air molecules
-    const float BALL_RADIUS = 0.185f;  // m (74mm diameter / 2)
+    const float BALL_RADIUS = 0.185f;
     const float BALL_MOMENT_OF_INERTIA = (2.0f / 5.0f) * BALL_MASS * BALL_RADIUS * BALL_RADIUS;
     
-    // Air particle size: much smaller than ball for realistic scale
-    // In reality, air molecules are nanometers, but for visualization we make them visible
-    // The effective collision radius should be much smaller than the ball
-    float airParticleRadius = 0.005f;  // 1mm - much smaller than ball (37mm radius)
+    float airParticleRadius = 0.005f;
     
-    // Scale factor for impulse: each air parcel represents many molecules
-    // In reality, ~526 collisions/second at 10 m/s, but we have fewer parcels
-    // So we scale down the impulse to account for the fact that each parcel
-    // represents many individual collisions that should be averaged
-    // This is a simplification - ideally we'd use statistical methods
     const float IMPULSE_SCALE_FACTOR = 0.01f;  // Scale down impulses by 100x
+    
+    // Wind parameters (wind velocity in m/s)
+    // Set these to non-zero values to simulate wind
+    // For still air, set both to 0.0f
+    const float WIND_VELOCITY_X = 2.0f;  // Wind speed in x direction (m/s)
+    const float WIND_VELOCITY_Y = 0.0f;  // Wind speed in y direction (m/s)
+    // Wind turbulence: small random variations in wind speed
+    const float WIND_TURBULENCE = 0.1f;  // Random variation as fraction of wind speed
     
     // Use proper physics constants
     float ballMass = BALL_MASS;
@@ -408,16 +408,34 @@ int main() {
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> xDist(-rectHalfWidth + airParticleRadius, rectHalfWidth - airParticleRadius);
     std::uniform_real_distribution<float> yDist(-rectHalfHeight + airParticleRadius, rectHalfHeight - airParticleRadius);
-    // For still air, particles should have near-zero velocity
-    // They only move due to collisions with the ball
-    std::uniform_real_distribution<float> velDist(-0.00001f, 0.00001f);  // Very small random initial velocities (still air)
+    
+    // Calculate wind velocity with turbulence
+    float windVx = WIND_VELOCITY_X;
+    float windVy = WIND_VELOCITY_Y;
+    float windSpeed = sqrtf(windVx * windVx + windVy * windVy);
     
     // Generate random positions and velocities for air particles within the court
     for (int i = 0; i < numAirParticles; i++) {
         float x = xDist(gen);
         float y = yDist(gen);
-        float vx = velDist(gen);
-        float vy = velDist(gen);
+        
+        // Set initial velocity based on wind
+        float vx, vy;
+        if (windSpeed > 0.0f) {
+            // Wind is present: add wind velocity with some turbulence
+            std::uniform_real_distribution<float> turbDist(-WIND_TURBULENCE, WIND_TURBULENCE);
+            float turbX = turbDist(gen) * windSpeed;
+            float turbY = turbDist(gen) * windSpeed;
+            vx = windVx + turbX;
+            vy = windVy + turbY;
+        } else {
+            // Still air: particles have near-zero velocity
+            // They only move due to collisions with the ball
+            std::uniform_real_distribution<float> velDist(-0.00001f, 0.00001f);
+            vx = velDist(gen);
+            vy = velDist(gen);
+        }
+        
         airParticles.push_back(AirParticle(x, y, vx, vy, particleMass));
     }
     
@@ -427,7 +445,7 @@ int main() {
     // circleRadius is now set above from BALL_RADIUS
     float circleVelX = 10.0f;  // Velocity in x direction
     float circleVelY = 10.0f;   // Velocity in y direction
-    float circleSpin = 0.0f;  // Angular velocity (spin) - scalar in 2D
+    float circleSpin = 0.5f;  // Angular velocity (spin) - scalar in 2D
     
     // Main render loop
     const float timestep = 0.001f;  // 0.001s time step (from physics.txt)
@@ -457,7 +475,6 @@ int main() {
                 
                 if (distance < minDistance && distance > 0.0001f) {  // Collision detected
                     // Normalize collision vector (from particle1 to particle2)
-                    std::cout << "collision" << std::endl;
                     float nx = dx / distance;  // Unit normal n
                     float ny = dy / distance;
                     
