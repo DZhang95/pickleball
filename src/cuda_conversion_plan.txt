@@ -1,0 +1,140 @@
+Below is a step-by-step CUDA migration plan with rationale, mapping to your existing code, and implementation notes you can follow — no code changes made yet.
+
+High-level strategy
+
+Start small and iterate: first move the embarrassingly-parallel pieces (particle integration, ball→particle checks) to CUDA, validate, then add neighbor search and particle–particle collision kernels for scalability.
+Keep CPU fallback and small-N correctness tests. Use SoA memory layout for coalesced access. Profile early and often; avoid premature full rewrite.
+Concrete step-by-step plan
+
+Baseline profiling and tests
+Why: know where to invest effort. If air count is small (3k) GPU may not help much.
+What to do:
+Add simple high-resolution timers (std::chrono) around these phases in the main loop: position integration, air–air collision, ball–air collision, rendering.
+Produce a small test harness: measure time for N = {3k, 30k, 300k}.
+Outcome: prioritized list of hotspots and estimated speedup target.
+Prepare build and scaffolding
+Why: compile CUDA source and keep CPU fallback.
+What to do:
+Convert build to support nvcc (CMake is recommended; alternatively extend Makefile to call nvcc for .cu files).
+Add compile-time flag (e.g., USE_CUDA) so code can select GPU or CPU implementation.
+Add a tiny CUDA helper (cuda_utils.cu/.h) for checking device, errors, and initialization.
+Outcome: project builds with and without CUDA.
+Refactor data layout to SoA (Array of Structures -> Structure of Arrays)
+Why: GPU memory coalescing, simpler device kernels.
+What to change:
+Replace vector<AirParticle> with std::vector<float> posX, posY, velX, velY, mass (or use thrust::device_vector later).
+Keep helper functions to convert between current AoS and SoA until fully migrated.
+For the ball (single object) keep a small struct (float x,y,vx,vy,spin) that can be transferred as a small device struct or passed by value.
+Outcome: compact, aligned buffers ready for cudaMemcpy or direct device allocation.
+Implement and validate integration kernel (position + wind)
+Why: easiest win and validates data pipeline.
+Kernel design:
+Kernel: integrateParticles(posX, posY, velX, velY, dt, windVx, windVy, n)
+Each thread i: vel += wind/forces; pos += vel * dt;
+Validation:
+Run CPU vs GPU for same initial RNG seed and small N; compare checksums or per-particle values.
+Outcome: working end-to-end host→device→host transfer.
+Implement ball–particle kernel (single-ball interactions)
+Why: Each particle interacts with a single ball — fully parallelizable, no particle–particle data races (except accumulation to ball).
+Kernel design:
+Kernel per-particle:
+Compute distance to ball, collision test.
+If collision: compute impulses, update particle vel (local).
+Compute spin_change contribution for ball from this particle: float spin_delta_i.
+Write particle velocity back to vel arrays.
+Accumulate spin_delta_i into a per-block partial sum (shared memory), then atomicAdd to global ball_spin_delta.
+Apply accumulated ball_spin_delta to ball on host or via a small device kernel after particle kernel.
+Synchronization:
+Use atomicAdd for the ball spin accumulator (float atomicAdd is supported on modern GPUs).
+Outcome: collisions with ball handled in parallel; ball updates applied safely.
+Implement spatial hashing / uniform grid (cell lists)
+Why: avoids O(n^2) particle–particle checks; essential for many particles.
+Steps:
+Choose cell size = interaction radius (2*airParticleRadius or slightly larger).
+Kernel A: compute cell index per particle (integer) and write pair (cellIdx, particleIdx) to array.
+Kernel B: sort particle indices by cell (use thrust::sort_by_key or radix sort in CUDA).
+Kernel C: build cell start/end offsets (scan over sorted keys).
+Option B (faster): use atomic counters per cell to append lists into fixed-size buffers (needs bounding cell population or 2-pass to count then create).
+Outcome: per-cell lists enabling neighbor search in O(n + k) where k is number of neighbor pairs.
+Particle–particle collision kernel
+Why: resolve air–air collisions efficiently on GPU.
+Approaches:
+Per-particle examine neighbors in same + adjacent cells.
+Two-phase impulse accumulation:
+Phase 1 (compute): compute impulses for collisions encountered and append per-particle impulse contributions into staging arrays (impulseX[i], impulseY[i]).
+Phase 2 (apply): another kernel applies impulses to velocities (no conflicts).
+Alternate: per-collision atomicAdd to vel arrays (works but atomics can be heavy).
+Implementation notes:
+Use shared memory per block for tile-based neighbor processing if needed.
+Clamp kernel launches so each thread handles a bounded number of neighbor checks to balance workload.
+Outcome: scalable particle–particle interactions.
+Concurrency & numeric considerations (atomics vs staging)
+Why: atomics are simple but can be a bottleneck with many threads writing same targets.
+Options:
+Use per-thread or per-block staging buffers for impulses, then reduce to per-particle values using parallel reduction (lower atomic contention).
+Use 32-bit float atomicAdd for per-particle accumulators; for very high densities optimize further.
+Also consider determinism: GPU floating atomic operations may be non-deterministic; if deterministic results needed keep CPU fallback.
+Ball spin and global reductions
+Why: ball spin is affected by many particle collisions; we must reduce particle contributions correctly.
+Technique:
+Each particle kernel produces spin contribution in a per-block shared accumulator; after the block finishes, the block atomically adds its partial to the global ball_spin_delta (or writes to an array and a small reduction kernel sums them).
+Outcome: correct and relatively low-contention accumulation.
+Integrate Magnus & other continuous forces on GPU
+Why: continuous forces are simple per-particle ops and should be in the integrate kernel. Ball Magnus affects ball linear vel — ball is single-threaded host update and can read accumulated deltas from GPU.
+Rendering integration and optional CUDA-OpenGL interop
+Why: avoid device→host→GL roundtrip for particle positions.
+Steps:
+Create particle VBOs (position) and register them with CUDA via cudaGraphicsGLRegisterBuffer.
+In CUDA path: map buffer, get device pointer, write positions directly into the VBO from kernels, unmap, then draw with existing OpenGL code (no extra copies).
+Be careful about context and synchronization (glFinish / cudaGraphicsMapResources).
+Outcome: minimal CPU-GPU data transfer for rendering.
+Testing, profiling, and tuning
+Tools: nvprof (deprecated), Nsight Systems, Nsight Compute, Visual Profiler where available.
+What to measure:
+Kernel durations, memory throughput, occupancy, atomic stalls.
+Time spent in data transfer.
+Tuning knobs:
+Block size (32, 64, 128, 256), use shared memory for neighbor buffers, reduce global atomics by block reductions, memory alignment and padding, prefer float4 copies for bulk transfers.
+Outcome: tuned kernels with documented performance gains.
+Validation and CI
+Tests:
+Small N regression tests comparing CPU vs GPU numerically (allow small eps differences).
+Conservation tests (linear momentum) and sanity checks (no NaNs).
+CI:
+If CI supports GPUs, add CUDA build/test; otherwise, mark CUDA tests optional.
+Documentation:
+Add README notes about enabling CUDA, device requirements, and runtime flags.
+Implementation details & tips
+
+Data layout
+
+Use SoA: float* posX, posY, velX, velY, mass; allocate on device with cudaMalloc or use cudaMallocHost for pinned host memory.
+For initial simplicity, use cudaMemcpyHtoD/HtoH to copy positions each frame. Later use persistent device arrays or map VBOs.
+Memory transfers
+
+Minimize host↔device copies; keep particle buffers on device and only copy small summaries (e.g., ball state) to/from host when needed.
+Use pinned (page-locked) host memory or unified memory only if conservative; explicit cudaMemcpy usually yields best control.
+Kernels & launch parameters
+
+For N particles, launch ceil(N/threadsPerBlock) blocks.
+Use thread-per-particle mapping wherever possible to simplify logic.
+Atomics
+
+float atomicAdd is supported on modern devices; if targeting older GPUs or double precision, implement alternatives.
+Reduce atomic pressure by accumulating per-warp or per-block and writing once per block.
+Determinism & accuracy
+
+Floating atomic accumulation order affects result; if exact reproducibility is required, run on CPU or use fixed-point reduction.
+Debugging
+
+Use CUDA printf in kernels for small tests (very slow).
+Copy small data slices back to host for inspection.
+Use sanitizers (cuda-memcheck).
+Handling collisions and tunneling
+
+Current timestep may allow tunneling. Options:
+Reduce dt, or
+Implement swept collision detection (more complex) or substep multiple physics steps per rendered frame.
+Small N caveat
+
+For N ~3k, overhead of kernels + copies may reduce benefit. Use batching or increase particle count to amortize kernel overhead.

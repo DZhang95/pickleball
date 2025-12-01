@@ -290,18 +290,14 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
     
-    // 600x600 window
-    GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor();
-    const GLFWvidmode* vidMode = primaryMonitor ? glfwGetVideoMode(primaryMonitor) : NULL;
-    int winW = 1200, winH = 1200;
-    GLFWwindow* window = NULL;
-    window = glfwCreateWindow(winW, winH, "2D Rectangle Renderer", NULL, NULL);
+    // Create window with square aspect ratio (1:1) so circles appear circular
+    GLFWwindow* window = glfwCreateWindow(600, 600, "2D Rectangle Renderer", NULL, NULL);
     if (window == NULL) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
         return -1;
     }
-
+    
     glfwMakeContextCurrent(window);
 #ifndef __APPLE__
     glewExperimental = GL_TRUE;
@@ -311,12 +307,6 @@ int main(int argc, char** argv) {
         return -1;
     }
 #endif    
-
-    // Set initial viewport to the actual framebuffer size and register resize callback
-    int fbW, fbH;
-    glfwGetFramebufferSize(window, &fbW, &fbH);
-    if (fbW > 0 && fbH > 0) glViewport(0, 0, fbW, fbH);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     
     // Create shader program for rectangle
     unsigned int shaderProgram = createShaderProgram();
@@ -879,33 +869,11 @@ int main(int argc, char** argv) {
             glfwSetWindowTitle(window, title.c_str());
         }
 
-        // If ball is allowed to escape, terminate the program when it fully leaves
-        // the rectangular world. We consider the ball to have escaped when its
-        // entire circle (center +/- radius) lies outside the rectangle on any side.
-        if (allowBallEscape) {
-            bool ballOutsideLeft = (circleX + circleRadius < -rectHalfWidth);
-            bool ballOutsideRight = (circleX - circleRadius > rectHalfWidth);
-            bool ballOutsideBottom = (circleY + circleRadius < -rectHalfHeight);
-            bool ballOutsideTop = (circleY - circleRadius > rectHalfHeight);
-
-            if (ballOutsideLeft || ballOutsideRight || ballOutsideBottom || ballOutsideTop) {
-                break;
-            }
-        }        
-
         // Increment timestep
         timestep += timestepSize;
 
         // Swap buffers and poll events
         glfwSwapBuffers(window);
-        glfwPollEvents();
-    }
-
-    while(1){
-        // Keep window open after simulation ends
-        if (glfwWindowShouldClose(window)) {
-            break;
-        }
         glfwPollEvents();
     }
     
