@@ -525,6 +525,8 @@ int main(int argc, char** argv) {
     float circleSpin = 100.0f;  // Angular velocity (spin) - scalar in 2D
     // If true the ball is allowed to leave the rectangular world (no bounce)
     const bool allowBallEscape = true;
+    // If true air parcels are allowed to leave the rectangular world (no bounce)
+    const bool allowAirEscape = true;
     // Path trace: store recent ball center positions in NDC space (only used if showPath)
     std::vector<std::pair<float,float>> ballPath;
     const size_t maxPathPoints = 5000; // cap to avoid unbounded growth
@@ -735,28 +737,52 @@ int main(int argc, char** argv) {
         }
         
         // Check for collisions with rectangle boundaries (air particles)
-        for (size_t i = 0; i < airParticles.size(); i++) {
+        // If allowAirEscape == false -> bounce at boundaries
+        // If allowAirEscape == true -> delete particles once they have fully left the world
+        for (size_t i = 0; i < airParticles.size(); ) {
             AirParticle& particle = airParticles[i];
-            
-            // Left boundary
-            if (particle.x - airParticleRadius <= -rectHalfWidth) {
-                particle.x = -rectHalfWidth + airParticleRadius;
-                particle.velX = -particle.velX;
-            }
-            // Right boundary
-            if (particle.x + airParticleRadius >= rectHalfWidth) {
-                particle.x = rectHalfWidth - airParticleRadius;
-                particle.velX = -particle.velX;
-            }
-            // Bottom boundary
-            if (particle.y - airParticleRadius <= -rectHalfHeight) {
-                particle.y = -rectHalfHeight + airParticleRadius;
-                particle.velY = -particle.velY;
-            }
-            // Top boundary
-            if (particle.y + airParticleRadius >= rectHalfHeight) {
-                particle.y = rectHalfHeight - airParticleRadius;
-                particle.velY = -particle.velY;
+
+            if (!allowAirEscape) {
+                // Left boundary
+                if (particle.x - airParticleRadius <= -rectHalfWidth) {
+                    particle.x = -rectHalfWidth + airParticleRadius;
+                    particle.velX = -particle.velX;
+                }
+                // Right boundary
+                if (particle.x + airParticleRadius >= rectHalfWidth) {
+                    particle.x = rectHalfWidth - airParticleRadius;
+                    particle.velX = -particle.velX;
+                }
+                // Bottom boundary
+                if (particle.y - airParticleRadius <= -rectHalfHeight) {
+                    particle.y = -rectHalfHeight + airParticleRadius;
+                    particle.velY = -particle.velY;
+                }
+                // Top boundary
+                if (particle.y + airParticleRadius >= rectHalfHeight) {
+                    particle.y = rectHalfHeight - airParticleRadius;
+                    particle.velY = -particle.velY;
+                }
+
+                // keep this particle, advance index
+                ++i;
+            } else {
+                // Determine if the particle has fully left the rectangular world.
+                // We treat a particle as escaped when its entire circle (center +/- radius)
+                // lies outside the rectangle on any side.
+                bool outsideLeft = (particle.x + airParticleRadius < -rectHalfWidth);
+                bool outsideRight = (particle.x - airParticleRadius > rectHalfWidth);
+                bool outsideBottom = (particle.y + airParticleRadius < -rectHalfHeight);
+                bool outsideTop = (particle.y - airParticleRadius > rectHalfHeight);
+
+                if (outsideLeft || outsideRight || outsideBottom || outsideTop) {
+                    // Erase this particle. We do not increment i so the next element
+                    // that shifted into position i will be processed on the next iteration.
+                    airParticles.erase(airParticles.begin() + i);
+                } else {
+                    // Particle still inside (or partially overlapping); keep it
+                    ++i;
+                }
             }
         }
 
