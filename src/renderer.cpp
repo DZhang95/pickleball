@@ -520,7 +520,7 @@ int main(int argc, char** argv) {
     float circleX = -4.0f;
     float circleY = -2.0f;
     // circleRadius is now set above from BALL_RADIUS
-    float circleVelX = 80.0f;  // Velocity in x direction
+    float circleVelX = 40.0f;  // Velocity in x direction
     float circleVelY = 10.0f;   // Velocity in y direction
     float circleSpin = 100.0f;  // Angular velocity (spin) - scalar in 2D
     // If true the ball is allowed to leave the rectangular world (no bounce)
@@ -532,13 +532,14 @@ int main(int argc, char** argv) {
     const size_t maxPathPoints = 5000; // cap to avoid unbounded growth
     
     // Main render loop
-    const float timestep = 0.001f;  // 0.001s time step (from physics.txt)
+    const float timestepSize = 0.001f;  // 0.001s time step (from physics.txt)
+    float timestep = 0.0f;
     while (!glfwWindowShouldClose(window)) {
         // Accumulate spin changes for HUD/debugging this frame
         float spinDeltaAccumulator = 0.0f;
         // Update ball position based on velocity
-        circleX += circleVelX * timestep;
-        circleY += circleVelY * timestep;
+        circleX += circleVelX * timestepSize;
+        circleY += circleVelY * timestepSize;
 
         // Append current ball center (in NDC) to path trace if enabled
         if (showPath) {
@@ -552,8 +553,8 @@ int main(int argc, char** argv) {
         
         // Update air particle positions
         for (size_t i = 0; i < airParticles.size(); i++) {
-            airParticles[i].x += airParticles[i].velX * timestep;
-            airParticles[i].y += airParticles[i].velY * timestep;
+            airParticles[i].x += airParticles[i].velX * timestepSize;
+            airParticles[i].y += airParticles[i].velY * timestepSize;
         }
         
         // Check for collisions between air particles (AIR-AIR collisions)
@@ -796,8 +797,8 @@ int main(int argc, char** argv) {
             float magnusAx = k_magnus * (-circleSpin * circleVelY) / ballMass;
             float magnusAy = k_magnus * ( circleSpin * circleVelX) / ballMass;
             // Integrate into velocity
-            circleVelX += magnusAx * timestep;
-            circleVelY += magnusAy * timestep;
+            circleVelX += magnusAx * timestepSize;
+            circleVelY += magnusAy * timestepSize;
         }
         
         // Clear the screen
@@ -853,7 +854,7 @@ int main(int argc, char** argv) {
             glDeleteVertexArrays(1, &pathVAO);
         }
         
-        // Update an on-screen HUD via the window title with ball position, velocity, and spin
+        // Update an on-screen HUD via the window title with ball position, velocity, spin, dspin and timestepSize
         {
             std::ostringstream oss;
             // Increase precision so small spin changes are visible in the HUD
@@ -861,10 +862,15 @@ int main(int argc, char** argv) {
             oss << "Ball pos=(" << circleX << "," << circleY << ") ";
             oss << "vel=(" << circleVelX << "," << circleVelY << ") ";
             oss << "spin=" << circleSpin << " ";
-            oss << "dspin=" << spinDeltaAccumulator;
+            oss << "dspin=" << spinDeltaAccumulator << " ";
+            // Show timestep in seconds (same numeric precision)
+            oss << "dt=" << timestep << "s";
             std::string title = oss.str();
             glfwSetWindowTitle(window, title.c_str());
         }
+
+        // Increment timestep
+        timestep += timestepSize;
 
         // Swap buffers and poll events
         glfwSwapBuffers(window);
