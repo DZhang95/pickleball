@@ -14,6 +14,7 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <cstring>
 
 // Vertex shader source code
 const char* vertexShaderSource = 
@@ -60,6 +61,16 @@ const char* airParticleFragmentShaderSource =
 "    FragColor = vec4(0.7f, 0.7f, 0.7f, 1.0f);\n"
 "}\n";
 
+
+// Fragment shader for path trace (thin red line)
+const char* pathFragmentShaderSource =
+"#version 330 core\n"
+"out vec4 FragColor;\n"
+"\n"
+"void main() {\n"
+"    FragColor = vec4(0.9f, 0.1f, 0.1f, 1.0f);\n"
+"}\n"
+;
 // Function to compile shader
 unsigned int compileShader(unsigned int type, const char* source) {
     unsigned int shader = glCreateShader(type);
@@ -255,7 +266,15 @@ struct AirParticle {
         : x(px), y(py), velX(vx), velY(vy), mass(m) {}
 };
 
-int main() {
+int main(int argc, char** argv) {
+    // Parse command-line arguments
+    bool showPath = false; // off by default
+    for (int ai = 1; ai < argc; ++ai) {
+        if (std::strcmp(argv[ai], "--trace-path") == 0 || std::strcmp(argv[ai], "-t") == 0 || std::strcmp(argv[ai], "--path") == 0) {
+            showPath = true;
+            break;
+        }
+    }
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
@@ -380,6 +399,35 @@ int main() {
         glfwTerminate();
         return -1;
     }
+
+    // Optionally create shader program for the path trace (thin red line)
+    unsigned int pathShaderProgram = 0;
+    if (showPath) {
+        unsigned int pathVertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
+        unsigned int pathFragmentShader = compileShader(GL_FRAGMENT_SHADER, pathFragmentShaderSource);
+        if (pathVertexShader != 0 && pathFragmentShader != 0) {
+            pathShaderProgram = glCreateProgram();
+            glAttachShader(pathShaderProgram, pathVertexShader);
+            glAttachShader(pathShaderProgram, pathFragmentShader);
+            glLinkProgram(pathShaderProgram);
+
+            int success;
+            char infoLog[512];
+            glGetProgramiv(pathShaderProgram, GL_LINK_STATUS, &success);
+            if (!success) {
+                glGetProgramInfoLog(pathShaderProgram, 512, NULL, infoLog);
+                std::cerr << "WARNING: path shader linking failed; disabling path trace\n" << infoLog << std::endl;
+                glDeleteProgram(pathShaderProgram);
+                pathShaderProgram = 0;
+                showPath = false;
+            }
+            glDeleteShader(pathVertexShader);
+            glDeleteShader(pathFragmentShader);
+        } else {
+            std::cerr << "WARNING: path shaders failed to compile; disabling path trace" << std::endl;
+            showPath = false;
+        }
+    }
     
     // config: world physical size (meters)
     const float WORLD_W = 13.4112f; // length (m)
@@ -474,9 +522,12 @@ int main() {
     // circleRadius is now set above from BALL_RADIUS
     float circleVelX = 80.0f;  // Velocity in x direction
     float circleVelY = 10.0f;   // Velocity in y direction
-    float circleSpin = 10.0f;  // Angular velocity (spin) - scalar in 2D
+    float circleSpin = 100.0f;  // Angular velocity (spin) - scalar in 2D
     // If true the ball is allowed to leave the rectangular world (no bounce)
     const bool allowBallEscape = true;
+    // Path trace: store recent ball center positions in NDC space (only used if showPath)
+    std::vector<std::pair<float,float>> ballPath;
+    const size_t maxPathPoints = 5000; // cap to avoid unbounded growth
     
     // Main render loop
     const float timestep = 0.001f;  // 0.001s time step (from physics.txt)
@@ -486,6 +537,16 @@ int main() {
         // Update ball position based on velocity
         circleX += circleVelX * timestep;
         circleY += circleVelY * timestep;
+
+        // Append current ball center (in NDC) to path trace if enabled
+        if (showPath) {
+            ballPath.emplace_back(world_to_ndc_x(circleX), world_to_ndc_y(circleY));
+            if (ballPath.size() > maxPathPoints) {
+                // remove oldest points to keep vector size bounded
+                size_t removeCount = ballPath.size() - maxPathPoints;
+                ballPath.erase(ballPath.begin(), ballPath.begin() + removeCount);
+            }
+        }
         
         // Update air particle positions
         for (size_t i = 0; i < airParticles.size(); i++) {
@@ -737,6 +798,34 @@ int main() {
         // Render a circle (ball) inside the rectangle at its current position
         glUseProgram(circleShaderProgram);
         renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(circleRadius), 32);
+
+        // Render the ball path as a thin red line (GL_LINE_STRIP) if enabled
+        if (showPath && ballPath.size() >= 2 && pathShaderProgram != 0) {
+            glUseProgram(pathShaderProgram);
+            std::vector<float> pathVerts;
+            pathVerts.reserve(ballPath.size() * 2);
+            for (const auto &pt : ballPath) {
+                pathVerts.push_back(pt.first);
+                pathVerts.push_back(pt.second);
+            }
+
+            unsigned int pathVAO, pathVBO;
+            glGenVertexArrays(1, &pathVAO);
+            glBindVertexArray(pathVAO);
+
+            glGenBuffers(1, &pathVBO);
+            glBindBuffer(GL_ARRAY_BUFFER, pathVBO);
+            glBufferData(GL_ARRAY_BUFFER, pathVerts.size() * sizeof(float), pathVerts.data(), GL_STATIC_DRAW);
+
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+            glEnableVertexAttribArray(0);
+
+            glLineWidth(1.5f);
+            glDrawArrays(GL_LINE_STRIP, 0, (GLsizei)ballPath.size());
+
+            glDeleteBuffers(1, &pathVBO);
+            glDeleteVertexArrays(1, &pathVAO);
+        }
         
         // Update an on-screen HUD via the window title with ball position, velocity, and spin
         {
@@ -761,6 +850,7 @@ int main() {
     glDeleteProgram(circleShaderProgram);
     glDeleteProgram(netShaderProgram);
     glDeleteProgram(airParticleShaderProgram);
+    if (pathShaderProgram != 0) glDeleteProgram(pathShaderProgram);
     glfwTerminate();
     
     return 0;
