@@ -8,9 +8,12 @@
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <cstdlib>
+#include <algorithm>
 #include <vector>
 #include <cmath>
 #include <random>
+#include <sstream>
+#include <iomanip>
 
 // Vertex shader source code
 const char* vertexShaderSource = 
@@ -235,6 +238,13 @@ void renderNet(float centerX, float topY, float bottomY, float lineWidth) {
     glDeleteVertexArrays(1, &VAO);
 }
 
+// Framebuffer resize callback: keep the GL viewport in sync with window framebuffer size
+static void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    // Avoid setting a zero-sized viewport
+    if (width <= 0 || height <= 0) return;
+    glViewport(0, 0, width, height);
+}
+
 // Air particle structure (designed for future upgrade to realistic physics)
 struct AirParticle {
     float x, y;           // Position
@@ -371,9 +381,27 @@ int main() {
         return -1;
     }
     
-    // Rectangle boundaries (half width and half height)
-    float rectHalfWidth = 1.5f / 2.0f;  // 0.75
-    float rectHalfHeight = 1.3f / 2.0f;  // 0.65
+    // config: world physical size (meters)
+    const float WORLD_W = 13.4112f; // length (m)
+    const float WORLD_H = 6.096f;   // width (m)
+    const float world_cx = 0.0f, world_cy = 0.0f;
+
+    // Uniform NDC scale to preserve aspect (use same scale on X and Y)
+    const float NDC_SCALE = std::min(2.0f / WORLD_W, 2.0f / WORLD_H);
+
+    auto world_to_ndc_x = [&](float x){
+        return (x - world_cx) * NDC_SCALE;
+    };
+    auto world_to_ndc_y = [&](float y){
+        return (y - world_cy) * NDC_SCALE;
+    };
+    auto world_to_ndc_scale = [&](float s){
+        return s * NDC_SCALE;
+    };
+    
+    // Rectangle boundaries (half width and half height) in world meters
+    float rectHalfWidth = WORLD_W * 0.5f; // half-length
+    float rectHalfHeight = WORLD_H * 0.5f;   // half-width
     
     // Generate air particles (now with velocities for collision response)
     const int numAirParticles = 3000;
@@ -386,7 +414,7 @@ int main() {
     
     float airParticleRadius = 0.005f;
     
-    const float IMPULSE_SCALE_FACTOR = 0.01f;  // Scale down impulses by 100x
+    const float IMPULSE_SCALE_FACTOR = 1;  // Can scale down impulses
     const float AIR_AIR_IMPULSE_SCALE_FACTOR = 0.1f;
     
     // Wind parameters (wind velocity in m/s)
@@ -441,12 +469,14 @@ int main() {
     }
     
     // Circle physics variables
-    float circleX = 0.0f;
-    float circleY = 0.0f;
+    float circleX = -4.0f;
+    float circleY = -2.0f;
     // circleRadius is now set above from BALL_RADIUS
-    float circleVelX = 10.0f;  // Velocity in x direction
+    float circleVelX = 120.0f;  // Velocity in x direction
     float circleVelY = 10.0f;   // Velocity in y direction
     float circleSpin = 0.5f;  // Angular velocity (spin) - scalar in 2D
+    // If true the ball is allowed to leave the rectangular world (no bounce)
+    const bool allowBallEscape = true;
     
     // Main render loop
     const float timestep = 0.001f;  // 0.001s time step (from physics.txt)
@@ -587,25 +617,28 @@ int main() {
         }
         
         // Check for collisions with rectangle boundaries and bounce (ball)
-        // Left boundary
-        if (circleX - circleRadius <= -rectHalfWidth) {
-            circleX = -rectHalfWidth + circleRadius;
-            circleVelX = -circleVelX;
-        }
-        // Right boundary
-        if (circleX + circleRadius >= rectHalfWidth) {
-            circleX = rectHalfWidth - circleRadius;
-            circleVelX = -circleVelX;
-        }
-        // Bottom boundary
-        if (circleY - circleRadius <= -rectHalfHeight) {
-            circleY = -rectHalfHeight + circleRadius;
-            circleVelY = -circleVelY;
-        }
-        // Top boundary
-        if (circleY + circleRadius >= rectHalfHeight) {
-            circleY = rectHalfHeight - circleRadius;
-            circleVelY = -circleVelY;
+        // If `allowBallEscape` is true we skip bouncing and let the ball leave the world.
+        if (!allowBallEscape) {
+            // Left boundary
+            if (circleX - circleRadius <= -rectHalfWidth) {
+                circleX = -rectHalfWidth + circleRadius;
+                circleVelX = -circleVelX;
+            }
+            // Right boundary
+            if (circleX + circleRadius >= rectHalfWidth) {
+                circleX = rectHalfWidth - circleRadius;
+                circleVelX = -circleVelX;
+            }
+            // Bottom boundary
+            if (circleY - circleRadius <= -rectHalfHeight) {
+                circleY = -rectHalfHeight + circleRadius;
+                circleVelY = -circleVelY;
+            }
+            // Top boundary
+            if (circleY + circleRadius >= rectHalfHeight) {
+                circleY = rectHalfHeight - circleRadius;
+                circleVelY = -circleVelY;
+            }
         }
         
         // Check for collisions with rectangle boundaries (air particles)
@@ -639,24 +672,37 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT);
         
         // Render a rectangle at the center of the screen (the court)
-        // Coordinates are in normalized device coordinates (-1 to 1)
+        // Convert world meters -> NDC using uniform scale so the whole court fits
         glUseProgram(shaderProgram);
-        renderRectangle(0.0f, 0.0f, 1.5f, 1.3f); // Center, width=1.5, height=1.3
+        float rect_w_ndc = WORLD_W * NDC_SCALE;
+        float rect_h_ndc = WORLD_H * NDC_SCALE;
+        renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
         
         // Render the net splitting the court in half (vertical line at x=0)
         glUseProgram(netShaderProgram);
-        renderNet(0.0f, rectHalfHeight, -rectHalfHeight, 0.01f); // Center x=0, full height, thin line
+        renderNet(world_to_ndc_x(0.0f), world_to_ndc_y(rectHalfHeight), world_to_ndc_y(-rectHalfHeight), world_to_ndc_scale(0.01f));
         
         // Render air particles (now moving, small circles)
         glUseProgram(airParticleShaderProgram);
         for (size_t i = 0; i < airParticles.size(); i++) {
-            renderCircle(airParticles[i].x, airParticles[i].y, airParticleRadius, 16);
+            renderCircle(world_to_ndc_x(airParticles[i].x), world_to_ndc_y(airParticles[i].y), world_to_ndc_scale(airParticleRadius), 16);
         }
         
         // Render a circle (ball) inside the rectangle at its current position
         glUseProgram(circleShaderProgram);
-        renderCircle(circleX, circleY, circleRadius, 32);
+        renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(circleRadius), 32);
         
+        // Update an on-screen HUD via the window title with ball position, velocity, and spin
+        {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2);
+            oss << "Ball pos=(" << circleX << "," << circleY << ") ";
+            oss << "vel=(" << circleVelX << "," << circleVelY << ") ";
+            oss << "spin=" << circleSpin;
+            std::string title = oss.str();
+            glfwSetWindowTitle(window, title.c_str());
+        }
+
         // Swap buffers and poll events
         glfwSwapBuffers(window);
         glfwPollEvents();
