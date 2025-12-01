@@ -472,15 +472,17 @@ int main() {
     float circleX = -4.0f;
     float circleY = -2.0f;
     // circleRadius is now set above from BALL_RADIUS
-    float circleVelX = 120.0f;  // Velocity in x direction
+    float circleVelX = 80.0f;  // Velocity in x direction
     float circleVelY = 10.0f;   // Velocity in y direction
-    float circleSpin = 0.5f;  // Angular velocity (spin) - scalar in 2D
+    float circleSpin = 10.0f;  // Angular velocity (spin) - scalar in 2D
     // If true the ball is allowed to leave the rectangular world (no bounce)
     const bool allowBallEscape = true;
     
     // Main render loop
     const float timestep = 0.001f;  // 0.001s time step (from physics.txt)
     while (!glfwWindowShouldClose(window)) {
+        // Accumulate spin changes for HUD/debugging this frame
+        float spinDeltaAccumulator = 0.0f;
         // Update ball position based on velocity
         circleX += circleVelX * timestep;
         circleY += circleVelY * timestep;
@@ -587,32 +589,62 @@ int main() {
                 float relVelX = particle.velX - surfaceVelX;
                 float relVelY = particle.velY - surfaceVelY;
                 
-                // Calculate impulse: J = 2 * m * dot(v_rel, n) * n
-                float v_rel_dot_n = relVelX * nx + relVelY * ny;
-                float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
-                float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
-                
-                // Scale down impulse: each air parcel represents many molecules
-                // In reality, there are billions of tiny collisions that average out
-                // Since we have fewer, larger parcels, we scale down the effect
-                impulseX *= IMPULSE_SCALE_FACTOR;
-                impulseY *= IMPULSE_SCALE_FACTOR;
-                
-                // Update ball linear velocity: v_ball_new = v_ball + (J / M)
-                circleVelX += impulseX / ballMass;
-                circleVelY += impulseY / ballMass;
-                
-                // Update ball angular velocity: ω_new = ω + (cross(r, J) / I)
-                // In 2D: cross(r, J) = r.x * J.y - r.y * J.x (scalar)
-                // Note: spin change already uses the scaled impulse, so it's automatically scaled
-                float r_cross_J = rx * impulseY - ry * impulseX;
-                float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
-                circleSpin += spin_change;
-                
-                // Update air particle velocity (for still air, this would be minimal)
-                // For now, we'll apply the impulse to the particle as well
-                particle.velX -= impulseX / particle.mass;
-                particle.velY -= impulseY / particle.mass;
+                // Coulomb-friction impulse model (normal + tangential)
+                // Compute normal relative velocity
+                float v_rel_n = relVelX * nx + relVelY * ny;
+                if (v_rel_n < 0.0f) { // only apply impulse if bodies are approaching
+                    // Effective inverse masses
+                    float invMassBall = 1.0f / ballMass;
+                    float invMassPart = 1.0f / particle.mass;
+
+                    // Normal impulse magnitude (restitution e = 0 for inelastic)
+                    const float restitution = 0.0f;
+                    float Jn_mag = -(1.0f + restitution) * v_rel_n / (invMassBall + invMassPart);
+
+                    // Tangent vector (unit)
+                    float tx = -ny;
+                    float ty = nx;
+                    // Relative tangential velocity
+                    float v_rel_t = relVelX * tx + relVelY * ty;
+
+                    // Denominator for tangential impulse includes rotational coupling: R^2 / I
+                    float denom_t = invMassBall + invMassPart + (circleRadius * circleRadius) / BALL_MOMENT_OF_INERTIA;
+                    // Unclamped tangential impulse that would cancel tangential velocity
+                    float Jt_unc = - v_rel_t / denom_t;
+
+                    // Coulomb friction coefficient (tuneable)
+                    const float mu = 0.05f;
+                    float Jt = 0.0f;
+                    if (fabsf(Jt_unc) <= mu * Jn_mag) {
+                        // Sticking: use full tangential impulse
+                        Jt = Jt_unc;
+                    } else {
+                        // Sliding: clamp to Coulomb limit, direction opposes motion
+                        Jt = (Jt_unc > 0.0f ? 1.0f : -1.0f) * mu * Jn_mag;
+                    }
+
+                    // Total impulse = normal + tangential
+                    float impulseX = Jn_mag * nx + Jt * tx;
+                    float impulseY = Jn_mag * ny + Jt * ty;
+
+                    // Scale down overall impulse if desired (keeps prior behavior adjustable)
+                    impulseX *= IMPULSE_SCALE_FACTOR;
+                    impulseY *= IMPULSE_SCALE_FACTOR;
+
+                    // Apply linear impulse to ball and particle
+                    circleVelX += impulseX / ballMass;
+                    circleVelY += impulseY / ballMass;
+
+                    // Angular effect from tangential component (normal component gives zero torque because r is radial)
+                    float r_cross_J = rx * impulseY - ry * impulseX;
+                    float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
+                    circleSpin += spin_change;
+                    spinDeltaAccumulator += spin_change;
+
+                    // Particle receives opposite impulse
+                    particle.velX -= impulseX / particle.mass;
+                    particle.velY -= impulseY / particle.mass;
+                }
             }
         }
         
@@ -666,6 +698,20 @@ int main() {
                 particle.velY = -particle.velY;
             }
         }
+
+        // Continuous Magnus effect: add a lateral acceleration proportional to (omega x v)
+        // Simple 2D approximation: F_magnus = k_magnus * (omega x v), where omega is scalar
+        // In 2D: omega x v = (-omega * v.y, omega * v.x)
+        // a = F / m -> velocity update: v += (k_magnus * (omega x v) / m) * dt
+        {
+            const float k_magnus = 0.0005f; // tune this constant to change effect strength
+            // Compute magnus acceleration components
+            float magnusAx = k_magnus * (-circleSpin * circleVelY) / ballMass;
+            float magnusAy = k_magnus * ( circleSpin * circleVelX) / ballMass;
+            // Integrate into velocity
+            circleVelX += magnusAx * timestep;
+            circleVelY += magnusAy * timestep;
+        }
         
         // Clear the screen
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
@@ -695,10 +741,12 @@ int main() {
         // Update an on-screen HUD via the window title with ball position, velocity, and spin
         {
             std::ostringstream oss;
-            oss << std::fixed << std::setprecision(2);
+            // Increase precision so small spin changes are visible in the HUD
+            oss << std::fixed << std::setprecision(4);
             oss << "Ball pos=(" << circleX << "," << circleY << ") ";
             oss << "vel=(" << circleVelX << "," << circleVelY << ") ";
-            oss << "spin=" << circleSpin;
+            oss << "spin=" << circleSpin << " ";
+            oss << "dspin=" << spinDeltaAccumulator;
             std::string title = oss.str();
             glfwSetWindowTitle(window, title.c_str());
         }
