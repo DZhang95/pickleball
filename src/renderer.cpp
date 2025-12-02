@@ -369,25 +369,6 @@ int main(int argc, char** argv) {
     }
     // Quick sanity write to stderr so we can verify logging is captured
     std::cerr << "TIMING: program_start" << std::endl;
-    // If the user requested CUDA, run a tiny self-test to exercise the CUDA/CPU switch.
-    if (use_cuda_requested) {
-#ifdef HAVE_CUDA
-    std::cerr << "CUDA requested and compiled in: running small CUDA vecadd test..." << std::endl;
-    const int N = 1<<16; // small test size
-    std::vector<float> A(N), B(N), C(N);
-    for (int i = 0; i < N; ++i) { A[i] = float(i); B[i] = float(2*i); C[i] = 0.f; }
-    bool ok = cuda_vecadd(A.data(), B.data(), C.data(), N);
-    if (!ok) std::cerr << "CUDA vecadd reported failure; falling back to CPU for this test." << std::endl;
-    else std::cerr << "CUDA vecadd OK (sample): C[0]=" << C[0] << " C[1]=" << C[1] << " C[N-1]=" << C[N-1] << std::endl;
-#else
-    std::cerr << "CUDA requested but renderer was not built with CUDA support. Running CPU fallback test instead." << std::endl;
-    const int N = 1<<16;
-    std::vector<float> A(N), B(N), C(N);
-    for (int i = 0; i < N; ++i) { A[i] = float(i); B[i] = float(2*i); C[i] = 0.f; }
-    cpu_vecadd(A.data(), B.data(), C.data(), N);
-    std::cerr << "CPU vecadd OK (sample): C[0]=" << C[0] << " C[1]=" << C[1] << " C[N-1]=" << C[N-1] << std::endl;
-#endif
-    }
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
@@ -681,9 +662,49 @@ int main(int argc, char** argv) {
             // Update air particle positions
             {
                 ScopedTimer timer_air_integrate("physics_air_integrate", timestep);
-                for (size_t i = 0; i < airParticles.size(); i++) {
-                    airParticles[i].x += airParticles[i].velX * timestepSize;
-                    airParticles[i].y += airParticles[i].velY * timestepSize;
+                size_t nParticles = airParticles.size();
+                if (nParticles == 0) {
+                    /* nothing to do */;
+                } else if (use_cuda_requested) {
+#ifdef HAVE_CUDA
+                    // Prepare flat arrays for x and y updates: pos + vel*dt
+                    std::vector<float> A(nParticles), B(nParticles), C(nParticles);
+                    // X dimension
+                    for (size_t i = 0; i < nParticles; ++i) {
+                        A[i] = airParticles[i].x;
+                        B[i] = airParticles[i].velX * timestepSize;
+                    }
+                    bool okx = cuda_vecadd(A.data(), B.data(), C.data(), (int)nParticles);
+                    if (okx) {
+                        for (size_t i = 0; i < nParticles; ++i) airParticles[i].x = C[i];
+                    } else {
+                        // Fallback to CPU per-element update on failure
+                        for (size_t i = 0; i < nParticles; ++i) airParticles[i].x += airParticles[i].velX * timestepSize;
+                    }
+                    // Y dimension
+                    for (size_t i = 0; i < nParticles; ++i) {
+                        A[i] = airParticles[i].y;
+                        B[i] = airParticles[i].velY * timestepSize;
+                    }
+                    bool oky = cuda_vecadd(A.data(), B.data(), C.data(), (int)nParticles);
+                    if (oky) {
+                        for (size_t i = 0; i < nParticles; ++i) airParticles[i].y = C[i];
+                    } else {
+                        for (size_t i = 0; i < nParticles; ++i) airParticles[i].y += airParticles[i].velY * timestepSize;
+                    }
+#else
+                    // Renderer not built with CUDA; use CPU fallback
+                    for (size_t i = 0; i < nParticles; i++) {
+                        airParticles[i].x += airParticles[i].velX * timestepSize;
+                        airParticles[i].y += airParticles[i].velY * timestepSize;
+                    }
+#endif
+                } else {
+                    // Standard CPU update when CUDA not requested
+                    for (size_t i = 0; i < nParticles; i++) {
+                        airParticles[i].x += airParticles[i].velX * timestepSize;
+                        airParticles[i].y += airParticles[i].velY * timestepSize;
+                    }
                 }
             }
 
