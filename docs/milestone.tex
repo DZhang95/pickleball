@@ -1,0 +1,60 @@
+\documentclass{article}
+\usepackage[legalpaper, portrait, margin=1in]{geometry}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    urlcolor=blue,
+    linkcolor=blue,
+    citecolor=red
+}
+\usepackage{algorithm} % For pseudocode
+\usepackage{algpseudocode} % For pseudocode
+
+\title{Pickleball Flight Milestone Report}
+\author{Maxwell Feng, Daniel Zhang\\Website: \href{https://dzhang95.github.io/pickleball/}{https://dzhang95.github.io/pickleball/}}
+\date{December 1st 2025}
+
+\begin{document}
+
+\maketitle
+
+\pagebreak
+
+\section{Current Progress}
+
+We have implemented sequential versions of the 50\%, 75\%, part of the 100\% goals, and 125\% goals. This includes the rendering pipeline, air-ball collisions, air-air collisions, and wind. All collisions are calculated using impulse calculations, as described in physics.txt in our Github repository.
+
+Essentially, we have finished setting up the framework, allowing us to now parallelize computations using CUDA. Our 100\% goal is somewhat implemented, as we can vary the velocities and spin as parameters in our program but do not have the ability to instantaneously change the velocity of the ball at any point.
+
+\section{Goals/Deliverables}
+
+We decided that the planned milestones in the initial project proposal were somewhat unordered and that most could be done in parallel. As for most of the deliverables, it seems that we will be able to reach our goal of 125\%. We have reached up to 125\% for sequential implementations, so all that is left is the parallel implementations for all the milestones up to 125\%.
+
+It does seem unlikely that we will reach our 150\% goal of modeling 3 dimensions. We only have a week left to collect results and write our report, and reaching this final goal requires extra design and new implementations that we have not even considered yet.
+
+It does not seem that we will be able to compare our results with Ansys CFD. Our implementation sacrifices some correctness in accurate physics calculations (we reduce some impulses) for visibility in our simulations.
+
+Below, we list our new set of goals:
+
+\textit{NOTE: For the 50\%, 75\%, and 100\% goals we are creating both a sequential and parallel version for validation and to measure speedup.}
+\begin{itemize}
+\item \textbf{50\%} - No simulation of air particles, just "determine" how many particles impact the ball at every timestep and focus on tracking just the ball. The ball is smooth with no holes. The world is 2D. There is no spin.
+\item \textbf{75\%} - Add in simulation and tracking of air particles. The particles impacting the ball will no longer be arbitrarily decided, it will instead depend on the position of air particles. Air particles will not impact other air particles. Add in spin to the pickleball.
+\item \textbf{100\%} - Add in simulated collision with the ground. Add in the other player hitting the ball and changing the spin and velocity. Add in wind.
+\item \textbf{125\%} - Allow air particles to impact other air particles.
+\end{itemize}
+
+\section{Demo/Final Report Formatting}
+
+The main highlight of our final report will be the speedup contrast using CUDA. The speedup should vary on the number of air particles we spawn in our world and will discuss the time required to compute each frame. Currently, on a MacBook Pro with 6-core Intel i7 CPU, our sequential implementation can handle around 3000 air particles before stalling between frames. This is only a qualitative assessment, but our final report will have some timings and note how many air particles we can handle before our simulation begins to suffer when using CUDA vs only sequential.
+
+\section{Remaining Issues}
+
+Currently, we have been developing on our local machines. We still have not yet ported to the GHC machines, which we found do not have GLFW and GLEW installed (which are needed as dependencies for our OpenGL program). Otherwise, we think there will be no blockers or obstacles to completing the project, and majority of the remaining work will simply be coding and CUDA implementation.
+
+Also, due to the complexity of modeling the real world, we sacrifice some correctness on the simulation. For example, there are an extreme amount of air particles in the world with minuscule size. If we were to model each particle, our computational cost would be too high, and our visualization would not show the air particles, as they are too small. However, we believe the main point of the project is to demonstrate speedup using parallelization techniques, which our final report will show.
+
+\newpage
+
+\end{document}
