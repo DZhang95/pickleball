@@ -22,6 +22,9 @@
 #include <numeric>
 #include <fstream>
 
+// Optional CUDA test API (scaffolded). See src/cuda/*
+#include "cuda/cuda_kernels.h"
+
 // Vertex shader source code
 const char* vertexShaderSource = 
 "#version 330 core\n"
@@ -354,14 +357,37 @@ struct AirParticle {
 int main(int argc, char** argv) {
     // Parse command-line arguments
     bool showPath = false; // off by default
+    bool use_cuda_requested = false;
     for (int ai = 1; ai < argc; ++ai) {
         if (std::strcmp(argv[ai], "--trace-path") == 0 || std::strcmp(argv[ai], "-t") == 0 || std::strcmp(argv[ai], "--path") == 0) {
             showPath = true;
             break;
         }
+        if (std::strcmp(argv[ai], "--use-cuda") == 0 || std::strcmp(argv[ai], "--cuda") == 0) {
+            use_cuda_requested = true;
+        }
     }
     // Quick sanity write to stderr so we can verify logging is captured
     std::cerr << "TIMING: program_start" << std::endl;
+    // If the user requested CUDA, run a tiny self-test to exercise the CUDA/CPU switch.
+    if (use_cuda_requested) {
+#ifdef HAVE_CUDA
+    std::cerr << "CUDA requested and compiled in: running small CUDA vecadd test..." << std::endl;
+    const int N = 1<<16; // small test size
+    std::vector<float> A(N), B(N), C(N);
+    for (int i = 0; i < N; ++i) { A[i] = float(i); B[i] = float(2*i); C[i] = 0.f; }
+    bool ok = cuda_vecadd(A.data(), B.data(), C.data(), N);
+    if (!ok) std::cerr << "CUDA vecadd reported failure; falling back to CPU for this test." << std::endl;
+    else std::cerr << "CUDA vecadd OK (sample): C[0]=" << C[0] << " C[1]=" << C[1] << " C[N-1]=" << C[N-1] << std::endl;
+#else
+    std::cerr << "CUDA requested but renderer was not built with CUDA support. Running CPU fallback test instead." << std::endl;
+    const int N = 1<<16;
+    std::vector<float> A(N), B(N), C(N);
+    for (int i = 0; i < N; ++i) { A[i] = float(i); B[i] = float(2*i); C[i] = 0.f; }
+    cpu_vecadd(A.data(), B.data(), C.data(), N);
+    std::cerr << "CPU vecadd OK (sample): C[0]=" << C[0] << " C[1]=" << C[1] << " C[N-1]=" << C[N-1] << std::endl;
+#endif
+    }
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
