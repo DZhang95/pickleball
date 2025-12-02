@@ -15,6 +15,12 @@
 #include <sstream>
 #include <iomanip>
 #include <cstring>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
+#include <numeric>
+#include <fstream>
 
 // Vertex shader source code
 const char* vertexShaderSource = 
@@ -88,6 +94,85 @@ unsigned int compileShader(unsigned int type, const char* source) {
     }
     return shader;
 }
+
+// Timing helpers are enabled only when DEBUG is defined. When disabled we
+// provide small no-op replacements so the rest of the code compiles and runs
+// without the profiling overhead.
+#ifdef DEBUG
+static std::mutex g_timers_mutex;
+
+// Running totals (ms) and counts per phase
+static std::map<std::string, double> g_phase_total_ms;
+static std::map<std::string, size_t> g_phase_counts;
+
+struct ScopedTimer {
+    std::string name;
+    double sim_time; // -1 means unavailable
+    std::chrono::steady_clock::time_point t0;
+
+    // When created, track the time
+    ScopedTimer(const std::string &n, double sim_time_ = -1.0)
+      : name(n), sim_time(sim_time_), t0(std::chrono::steady_clock::now()) {}
+
+    // When destroyed, print out the duration
+    ~ScopedTimer() {
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::lock_guard<std::mutex> lk(g_timers_mutex);
+        // update running totals and counts
+        g_phase_total_ms[name] += ms;
+        g_phase_counts[name] += 1;
+        // print sim time if available, then phase and ms
+        if (sim_time >= 0.0) {
+            std::cerr << "TS=" << std::fixed << std::setprecision(6) << sim_time
+                      << " " << name << " " << ms << " ms" << std::endl;
+        } else {
+            std::cerr << name << " " << ms << " ms" << std::endl;
+        }
+    }
+};
+
+// Print collected totals (called at end of simulation)
+static void print_timing_totals() {
+    std::lock_guard<std::mutex> lk(g_timers_mutex);
+    std::cerr << "==== TIMING TOTALS ====" << std::endl;
+    // Per-phase totals
+    for (auto &kv : g_phase_total_ms) {
+        const std::string &phase = kv.first;
+        double total_ms = kv.second;
+        size_t cnt = g_phase_counts[phase];
+        double mean = (cnt > 0) ? (total_ms / (double)cnt) : 0.0;
+        std::cerr << phase << ": total=" << total_ms << " ms, count=" << cnt << ", mean=" << mean << " ms" << std::endl;
+    }
+
+    // Totals of interest
+    double frames_ms = g_phase_total_ms.count("frame_total") ? g_phase_total_ms["frame_total"] : 0.0;
+    size_t frames_count = g_phase_counts.count("frame_total") ? g_phase_counts["frame_total"] : 0;
+    double physics_total_ms = g_phase_total_ms.count("physics_total") ? g_phase_total_ms["physics_total"] : 0.0;
+
+    // Sum all physics sub-phases (those that start with "physics_" but are not physics_total)
+    double physics_subsum_ms = 0.0;
+    for (auto &kv : g_phase_total_ms) {
+        const std::string &phase = kv.first;
+        if (phase.rfind("physics_", 0) == 0 && phase != std::string("physics_total")) {
+            physics_subsum_ms += kv.second;
+        }
+    }
+
+    std::cerr << "-- Summary --" << std::endl;
+    std::cerr << "frames: count=" << frames_count << ", total_ms=" << frames_ms << ", mean_ms=" << (frames_count ? frames_ms / (double)frames_count : 0.0) << std::endl;
+    std::cerr << "physics_total (timer): total_ms=" << physics_total_ms << std::endl;
+    std::cerr << "physics_subtasks sum: total_ms=" << physics_subsum_ms << std::endl;
+    std::cerr << "======================" << std::endl;
+}
+#else
+// No-op versions when DEBUG is not defined
+struct ScopedTimer {
+    ScopedTimer(const std::string & /*n*/, double /*sim_time_*/ = -1.0) {}
+};
+
+static inline void print_timing_totals() {}
+#endif
 
 // Function to create shader program
 unsigned int createShaderProgram() {
@@ -275,6 +360,8 @@ int main(int argc, char** argv) {
             break;
         }
     }
+    // Quick sanity write to stderr so we can verify logging is captured
+    std::cerr << "TIMING: program_start" << std::endl;
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
@@ -545,325 +632,344 @@ int main(int argc, char** argv) {
     const float timestepSize = 0.001f;  // 0.001s time step (from physics.txt)
     float timestep = 0.0f;
     while (!glfwWindowShouldClose(window)) {
+        ScopedTimer timer_frame("frame_total", timestep);
         // Accumulate spin changes for HUD/debugging this frame
         float spinDeltaAccumulator = 0.0f;
-        // Update ball position based on velocity
-        circleX += circleVelX * timestepSize;
-        circleY += circleVelY * timestepSize;
+        // --- Physics section (timed) ---
+        {
+            ScopedTimer timer_physics("physics_total", timestep);
+            // Update ball position based on velocity
+            circleX += circleVelX * timestepSize;
+            circleY += circleVelY * timestepSize;
 
-        // Append current ball center (in NDC) to path trace if enabled
-        if (showPath) {
-            ballPath.emplace_back(world_to_ndc_x(circleX), world_to_ndc_y(circleY));
-            if (ballPath.size() > maxPathPoints) {
-                // remove oldest points to keep vector size bounded
-                size_t removeCount = ballPath.size() - maxPathPoints;
-                ballPath.erase(ballPath.begin(), ballPath.begin() + removeCount);
+            // Append current ball center (in NDC) to path trace if enabled
+            if (showPath) {
+                ballPath.emplace_back(world_to_ndc_x(circleX), world_to_ndc_y(circleY));
+                if (ballPath.size() > maxPathPoints) {
+                    // remove oldest points to keep vector size bounded
+                    size_t removeCount = ballPath.size() - maxPathPoints;
+                    ballPath.erase(ballPath.begin(), ballPath.begin() + removeCount);
+                }
             }
-        }
-        
-        // Update air particle positions
-        for (size_t i = 0; i < airParticles.size(); i++) {
-            airParticles[i].x += airParticles[i].velX * timestepSize;
-            airParticles[i].y += airParticles[i].velY * timestepSize;
-        }
-        
-        // Check for collisions between air particles (AIR-AIR collisions)
-        // Using impulse-based physics: calculate relative velocity and impulse
-        for (size_t i = 0; i < airParticles.size(); i++) {
-            for (size_t j = i + 1; j < airParticles.size(); j++) {
-                AirParticle& particle1 = airParticles[i];
-                AirParticle& particle2 = airParticles[j];
+
+            // Update air particle positions
+            {
+                ScopedTimer timer_air_integrate("physics_air_integrate", timestep);
+                for (size_t i = 0; i < airParticles.size(); i++) {
+                    airParticles[i].x += airParticles[i].velX * timestepSize;
+                    airParticles[i].y += airParticles[i].velY * timestepSize;
+                }
+            }
+
+            // Check for collisions between air particles (AIR-AIR collisions)
+            // Using impulse-based physics: calculate relative velocity and impulse
+            {
+                ScopedTimer timer_air_air("physics_air_air");
+                for (size_t i = 0; i < airParticles.size(); i++) {
+                    for (size_t j = i + 1; j < airParticles.size(); j++) {
+                    AirParticle& particle1 = airParticles[i];
+                    AirParticle& particle2 = airParticles[j];
+                    
+                    // Calculate distance between particle centers
+                    float dx = particle2.x - particle1.x;
+                    float dy = particle2.y - particle1.y;
+                    float distance = sqrtf(dx * dx + dy * dy);
+                    float minDistance = 2.0f * airParticleRadius;  // Both particles have same radius
+                    
+                    if (distance < minDistance && distance > 0.0001f) {  // Collision detected
+                        // Normalize collision vector (from particle1 to particle2)
+                        float nx = dx / distance;  // Unit normal n
+                        float ny = dy / distance;
+
+                        // Separate overlapping particles
+                        float overlap = minDistance - distance;
+                        float separationX = nx * overlap * 0.5f;
+                        float separationY = ny * overlap * 0.5f;
+
+                        // Push particles apart (equal mass, so equal separation)
+                        particle1.x -= separationX;
+                        particle1.y -= separationY;
+                        particle2.x += separationX;
+                        particle2.y += separationY;
+
+                        // Calculate relative velocity: v_rel = v2 - v1
+                        float relVelX = particle2.velX - particle1.velX;
+                        float relVelY = particle2.velY - particle1.velY;
+
+                        // Calculate impulse: J = 2 * m * dot(v_rel, n) * n
+                        // For air-air collisions, both particles have mass m = AIR_PARCEL_MASS
+                        float v_rel_dot_n = relVelX * nx + relVelY * ny;
+                        float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
+                        float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
+
+                        // Scale down impulse for air-air collisions (they're less important)
+                        impulseX *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+                        impulseY *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+
+                        // Update velocities: v_new = v + (J / m)
+                        // Particle 1 gets +J/m (in direction of n)
+                        // Particle 2 gets -J/m (opposite direction)
+                        particle1.velX += impulseX / AIR_PARCEL_MASS;
+                        particle1.velY += impulseY / AIR_PARCEL_MASS;
+                        particle2.velX -= impulseX / AIR_PARCEL_MASS;
+                        particle2.velY -= impulseY / AIR_PARCEL_MASS;
+                    }
+                    }
+                }
+            }
+
+            // Check for collisions between ball and air particles
+            // Using the physics model: calculate surface velocity, relative velocity, and impulse
+            {
+                ScopedTimer timer_ball_air("physics_ball_air", timestep);
+                for (size_t i = 0; i < airParticles.size(); i++) {
+                    AirParticle& particle = airParticles[i];
                 
-                // Calculate distance between particle centers
-                float dx = particle2.x - particle1.x;
-                float dy = particle2.y - particle1.y;
+                // Calculate distance between ball and particle centers
+                float dx = particle.x - circleX;  // Vector from ball to particle
+                float dy = particle.y - circleY;
                 float distance = sqrtf(dx * dx + dy * dy);
-                float minDistance = 2.0f * airParticleRadius;  // Both particles have same radius
+                float minDistance = circleRadius + airParticleRadius;
                 
                 if (distance < minDistance && distance > 0.0001f) {  // Collision detected
-                    // Normalize collision vector (from particle1 to particle2)
-                    float nx = dx / distance;  // Unit normal n
-                    float ny = dy / distance;
-                    
-                    // Separate overlapping particles
+                    // Normalize collision vector (r: from ball center to collision point)
+                    float r_mag = sqrtf(dx * dx + dy * dy);
+                    float nx = dx / r_mag;  // Unit normal n = r / |r|
+                    float ny = dy / r_mag;
+
+                    // r vector with magnitude R (ball radius) pointing to collision point
+                    float rx = nx * circleRadius;
+                    float ry = ny * circleRadius;
+
+                    // Separate overlapping objects
                     float overlap = minDistance - distance;
                     float separationX = nx * overlap * 0.5f;
                     float separationY = ny * overlap * 0.5f;
-                    
-                    // Push particles apart (equal mass, so equal separation)
-                    particle1.x -= separationX;
-                    particle1.y -= separationY;
-                    particle2.x += separationX;
-                    particle2.y += separationY;
-                    
-                    // Calculate relative velocity: v_rel = v2 - v1
-                    float relVelX = particle2.velX - particle1.velX;
-                    float relVelY = particle2.velY - particle1.velY;
-                    
-                    // Calculate impulse: J = 2 * m * dot(v_rel, n) * n
-                    // For air-air collisions, both particles have mass m = AIR_PARCEL_MASS
-                    float v_rel_dot_n = relVelX * nx + relVelY * ny;
-                    float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
-                    float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
-                    
-                    // Scale down impulse for air-air collisions (they're less important)
-                    impulseX *= AIR_AIR_IMPULSE_SCALE_FACTOR;
-                    impulseY *= AIR_AIR_IMPULSE_SCALE_FACTOR;
-                    
-                    // Update velocities: v_new = v + (J / m)
-                    // Particle 1 gets +J/m (in direction of n)
-                    // Particle 2 gets -J/m (opposite direction)
-                    particle1.velX += impulseX / AIR_PARCEL_MASS;
-                    particle1.velY += impulseY / AIR_PARCEL_MASS;
-                    particle2.velX -= impulseX / AIR_PARCEL_MASS;
-                    particle2.velY -= impulseY / AIR_PARCEL_MASS;
-                }
-            }
-        }
-        
-        // Check for collisions between ball and air particles
-        // Using the physics model: calculate surface velocity, relative velocity, and impulse
-        for (size_t i = 0; i < airParticles.size(); i++) {
-            AirParticle& particle = airParticles[i];
-            
-            // Calculate distance between ball and particle centers
-            float dx = particle.x - circleX;  // Vector from ball to particle
-            float dy = particle.y - circleY;
-            float distance = sqrtf(dx * dx + dy * dy);
-            float minDistance = circleRadius + airParticleRadius;
-            
-            if (distance < minDistance && distance > 0.0001f) {  // Collision detected
-                // Normalize collision vector (r: from ball center to collision point)
-                float r_mag = sqrtf(dx * dx + dy * dy);
-                float nx = dx / r_mag;  // Unit normal n = r / |r|
-                float ny = dy / r_mag;
-                
-                // r vector with magnitude R (ball radius) pointing to collision point
-                float rx = nx * circleRadius;
-                float ry = ny * circleRadius;
-                
-                // Separate overlapping objects
-                float overlap = minDistance - distance;
-                float separationX = nx * overlap * 0.5f;
-                float separationY = ny * overlap * 0.5f;
-                
-                // Push objects apart (proportional to mass)
-                float totalMass = ballMass + particle.mass;
-                circleX -= separationX * (particle.mass / totalMass);
-                circleY -= separationY * (particle.mass / totalMass);
-                particle.x += separationX * (ballMass / totalMass);
-                particle.y += separationY * (ballMass / totalMass);
-                
-                // Calculate surface velocity at point of impact: v_surface = v_ball + (ω × r)
-                // In 2D: ω × r = (-ω * r.y, ω * r.x) where ω is scalar angular velocity
-                float surfaceVelX = circleVelX - circleSpin * ry;
-                float surfaceVelY = circleVelY + circleSpin * rx;
-                
-                // Calculate relative velocity: v_rel = u_air - v_surface
-                float relVelX = particle.velX - surfaceVelX;
-                float relVelY = particle.velY - surfaceVelY;
-                
-                // Coulomb-friction impulse model (normal + tangential)
-                // Compute normal relative velocity
-                float v_rel_n = relVelX * nx + relVelY * ny;
-                if (v_rel_n < 0.0f) { // only apply impulse if bodies are approaching
-                    // Effective inverse masses
-                    float invMassBall = 1.0f / ballMass;
-                    float invMassPart = 1.0f / particle.mass;
 
-                    // Normal impulse magnitude (restitution e = 0 for inelastic)
-                    const float restitution = 0.0f;
-                    float Jn_mag = -(1.0f + restitution) * v_rel_n / (invMassBall + invMassPart);
+                    // Push objects apart (proportional to mass)
+                    float totalMass = ballMass + particle.mass;
+                    circleX -= separationX * (particle.mass / totalMass);
+                    circleY -= separationY * (particle.mass / totalMass);
+                    particle.x += separationX * (ballMass / totalMass);
+                    particle.y += separationY * (ballMass / totalMass);
 
-                    // Tangent vector (unit)
-                    float tx = -ny;
-                    float ty = nx;
-                    // Relative tangential velocity
-                    float v_rel_t = relVelX * tx + relVelY * ty;
+                    // Calculate surface velocity at point of impact: v_surface = v_ball + (ω × r)
+                    // In 2D: ω × r = (-ω * r.y, ω * r.x) where ω is scalar angular velocity
+                    float surfaceVelX = circleVelX - circleSpin * ry;
+                    float surfaceVelY = circleVelY + circleSpin * rx;
 
-                    // Denominator for tangential impulse includes rotational coupling: R^2 / I
-                    float denom_t = invMassBall + invMassPart + (circleRadius * circleRadius) / BALL_MOMENT_OF_INERTIA;
-                    // Unclamped tangential impulse that would cancel tangential velocity
-                    float Jt_unc = - v_rel_t / denom_t;
+                    // Calculate relative velocity: v_rel = u_air - v_surface
+                    float relVelX = particle.velX - surfaceVelX;
+                    float relVelY = particle.velY - surfaceVelY;
 
-                    // Coulomb friction coefficient (tuneable)
-                    const float mu = 0.05f;
-                    float Jt = 0.0f;
-                    if (fabsf(Jt_unc) <= mu * Jn_mag) {
-                        // Sticking: use full tangential impulse
-                        Jt = Jt_unc;
-                    } else {
-                        // Sliding: clamp to Coulomb limit, direction opposes motion
-                        Jt = (Jt_unc > 0.0f ? 1.0f : -1.0f) * mu * Jn_mag;
+                    // Coulomb-friction impulse model (normal + tangential)
+                    // Compute normal relative velocity
+                    float v_rel_n = relVelX * nx + relVelY * ny;
+                    if (v_rel_n < 0.0f) { // only apply impulse if bodies are approaching
+                        // Effective inverse masses
+                        float invMassBall = 1.0f / ballMass;
+                        float invMassPart = 1.0f / particle.mass;
+
+                        // Normal impulse magnitude (restitution e = 0 for inelastic)
+                        const float restitution = 0.0f;
+                        float Jn_mag = -(1.0f + restitution) * v_rel_n / (invMassBall + invMassPart);
+
+                        // Tangent vector (unit)
+                        float tx = -ny;
+                        float ty = nx;
+                        // Relative tangential velocity
+                        float v_rel_t = relVelX * tx + relVelY * ty;
+
+                        // Denominator for tangential impulse includes rotational coupling: R^2 / I
+                        float denom_t = invMassBall + invMassPart + (circleRadius * circleRadius) / BALL_MOMENT_OF_INERTIA;
+                        // Unclamped tangential impulse that would cancel tangential velocity
+                        float Jt_unc = - v_rel_t / denom_t;
+
+                        // Coulomb friction coefficient (tuneable)
+                        const float mu = 0.05f;
+                        float Jt = 0.0f;
+                        if (fabsf(Jt_unc) <= mu * Jn_mag) {
+                            // Sticking: use full tangential impulse
+                            Jt = Jt_unc;
+                        } else {
+                            // Sliding: clamp to Coulomb limit, direction opposes motion
+                            Jt = (Jt_unc > 0.0f ? 1.0f : -1.0f) * mu * Jn_mag;
+                        }
+
+                        // Total impulse = normal + tangential
+                        float impulseX = Jn_mag * nx + Jt * tx;
+                        float impulseY = Jn_mag * ny + Jt * ty;
+
+                        // Scale down overall impulse if desired (keeps prior behavior adjustable)
+                        impulseX *= IMPULSE_SCALE_FACTOR;
+                        impulseY *= IMPULSE_SCALE_FACTOR;
+
+                        // Apply linear impulse to ball and particle
+                        circleVelX += impulseX / ballMass;
+                        circleVelY += impulseY / ballMass;
+
+                        // Angular effect from tangential component (normal component gives zero torque because r is radial)
+                        float r_cross_J = rx * impulseY - ry * impulseX;
+                        float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
+                        circleSpin += spin_change;
+                        spinDeltaAccumulator += spin_change;
+
+                        // Particle receives opposite impulse
+                        particle.velX -= impulseX / particle.mass;
+                        particle.velY -= impulseY / particle.mass;
                     }
-
-                    // Total impulse = normal + tangential
-                    float impulseX = Jn_mag * nx + Jt * tx;
-                    float impulseY = Jn_mag * ny + Jt * ty;
-
-                    // Scale down overall impulse if desired (keeps prior behavior adjustable)
-                    impulseX *= IMPULSE_SCALE_FACTOR;
-                    impulseY *= IMPULSE_SCALE_FACTOR;
-
-                    // Apply linear impulse to ball and particle
-                    circleVelX += impulseX / ballMass;
-                    circleVelY += impulseY / ballMass;
-
-                    // Angular effect from tangential component (normal component gives zero torque because r is radial)
-                    float r_cross_J = rx * impulseY - ry * impulseX;
-                    float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
-                    circleSpin += spin_change;
-                    spinDeltaAccumulator += spin_change;
-
-                    // Particle receives opposite impulse
-                    particle.velX -= impulseX / particle.mass;
-                    particle.velY -= impulseY / particle.mass;
                 }
             }
-        }
-        
-        // Check for collisions with rectangle boundaries and bounce (ball)
-        // If `allowBallEscape` is true we skip bouncing and let the ball leave the world.
-        if (!allowBallEscape) {
-            // Left boundary
-            if (circleX - circleRadius <= -rectHalfWidth) {
-                circleX = -rectHalfWidth + circleRadius;
-                circleVelX = -circleVelX;
-            }
-            // Right boundary
-            if (circleX + circleRadius >= rectHalfWidth) {
-                circleX = rectHalfWidth - circleRadius;
-                circleVelX = -circleVelX;
-            }
-            // Bottom boundary
-            if (circleY - circleRadius <= -rectHalfHeight) {
-                circleY = -rectHalfHeight + circleRadius;
-                circleVelY = -circleVelY;
-            }
-            // Top boundary
-            if (circleY + circleRadius >= rectHalfHeight) {
-                circleY = rectHalfHeight - circleRadius;
-                circleVelY = -circleVelY;
-            }
-        }
-        
-        // Check for collisions with rectangle boundaries (air particles)
-        // If allowAirEscape == false -> bounce at boundaries
-        // If allowAirEscape == true -> delete particles once they have fully left the world
-        for (size_t i = 0; i < airParticles.size(); ) {
-            AirParticle& particle = airParticles[i];
 
-            if (!allowAirEscape) {
+            // Check for collisions with rectangle boundaries and bounce (ball)
+            // If `allowBallEscape` is true we skip bouncing and let the ball leave the world.
+            if (!allowBallEscape) {
                 // Left boundary
-                if (particle.x - airParticleRadius <= -rectHalfWidth) {
-                    particle.x = -rectHalfWidth + airParticleRadius;
-                    particle.velX = -particle.velX;
+                if (circleX - circleRadius <= -rectHalfWidth) {
+                    circleX = -rectHalfWidth + circleRadius;
+                    circleVelX = -circleVelX;
                 }
                 // Right boundary
-                if (particle.x + airParticleRadius >= rectHalfWidth) {
-                    particle.x = rectHalfWidth - airParticleRadius;
-                    particle.velX = -particle.velX;
+                if (circleX + circleRadius >= rectHalfWidth) {
+                    circleX = rectHalfWidth - circleRadius;
+                    circleVelX = -circleVelX;
                 }
                 // Bottom boundary
-                if (particle.y - airParticleRadius <= -rectHalfHeight) {
-                    particle.y = -rectHalfHeight + airParticleRadius;
-                    particle.velY = -particle.velY;
+                if (circleY - circleRadius <= -rectHalfHeight) {
+                    circleY = -rectHalfHeight + circleRadius;
+                    circleVelY = -circleVelY;
                 }
                 // Top boundary
-                if (particle.y + airParticleRadius >= rectHalfHeight) {
-                    particle.y = rectHalfHeight - airParticleRadius;
-                    particle.velY = -particle.velY;
+                if (circleY + circleRadius >= rectHalfHeight) {
+                    circleY = rectHalfHeight - circleRadius;
+                    circleVelY = -circleVelY;
                 }
+            }
 
-                // keep this particle, advance index
-                ++i;
-            } else {
-                // Determine if the particle has fully left the rectangular world.
-                // We treat a particle as escaped when its entire circle (center +/- radius)
-                // lies outside the rectangle on any side.
-                bool outsideLeft = (particle.x + airParticleRadius < -rectHalfWidth);
-                bool outsideRight = (particle.x - airParticleRadius > rectHalfWidth);
-                bool outsideBottom = (particle.y + airParticleRadius < -rectHalfHeight);
-                bool outsideTop = (particle.y - airParticleRadius > rectHalfHeight);
+            // Check for collisions with rectangle boundaries (air particles)
+            // If allowAirEscape == false -> bounce at boundaries
+            // If allowAirEscape == true -> delete particles once they have fully left the world
+            for (size_t i = 0; i < airParticles.size(); ) {
+                AirParticle& particle = airParticles[i];
 
-                if (outsideLeft || outsideRight || outsideBottom || outsideTop) {
-                    // Erase this particle. We do not increment i so the next element
-                    // that shifted into position i will be processed on the next iteration.
-                    airParticles.erase(airParticles.begin() + i);
-                } else {
-                    // Particle still inside (or partially overlapping); keep it
+                if (!allowAirEscape) {
+                    // Left boundary
+                    if (particle.x - airParticleRadius <= -rectHalfWidth) {
+                        particle.x = -rectHalfWidth + airParticleRadius;
+                        particle.velX = -particle.velX;
+                    }
+                    // Right boundary
+                    if (particle.x + airParticleRadius >= rectHalfWidth) {
+                        particle.x = rectHalfWidth - airParticleRadius;
+                        particle.velX = -particle.velX;
+                    }
+                    // Bottom boundary
+                    if (particle.y - airParticleRadius <= -rectHalfHeight) {
+                        particle.y = -rectHalfHeight + airParticleRadius;
+                        particle.velY = -particle.velY;
+                    }
+                    // Top boundary
+                    if (particle.y + airParticleRadius >= rectHalfHeight) {
+                        particle.y = rectHalfHeight - airParticleRadius;
+                        particle.velY = -particle.velY;
+                    }
+
+                    // keep this particle, advance index
                     ++i;
+                } else {
+                    // Determine if the particle has fully left the rectangular world.
+                    // We treat a particle as escaped when its entire circle (center +/- radius)
+                    // lies outside the rectangle on any side.
+                    bool outsideLeft = (particle.x + airParticleRadius < -rectHalfWidth);
+                    bool outsideRight = (particle.x - airParticleRadius > rectHalfWidth);
+                    bool outsideBottom = (particle.y + airParticleRadius < -rectHalfHeight);
+                    bool outsideTop = (particle.y - airParticleRadius > rectHalfHeight);
+
+                    if (outsideLeft || outsideRight || outsideBottom || outsideTop) {
+                        // Erase this particle. We do not increment i so the next element
+                        // that shifted into position i will be processed on the next iteration.
+                        airParticles.erase(airParticles.begin() + i);
+                    } else {
+                        // Particle still inside (or partially overlapping); keep it
+                        ++i;
+                    }
                 }
             }
-        }
 
-        // Continuous Magnus effect: add a lateral acceleration proportional to (omega x v)
-        // Simple 2D approximation: F_magnus = k_magnus * (omega x v), where omega is scalar
-        // In 2D: omega x v = (-omega * v.y, omega * v.x)
-        // a = F / m -> velocity update: v += (k_magnus * (omega x v) / m) * dt
-        {
-            const float k_magnus = 0.0005f; // tune this constant to change effect strength
-            // Compute magnus acceleration components
-            float magnusAx = k_magnus * (-circleSpin * circleVelY) / ballMass;
-            float magnusAy = k_magnus * ( circleSpin * circleVelX) / ballMass;
-            // Integrate into velocity
-            circleVelX += magnusAx * timestepSize;
-            circleVelY += magnusAy * timestepSize;
-        }
-        
-        // Clear the screen
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
-        glClear(GL_COLOR_BUFFER_BIT);
-        
-        // Render a rectangle at the center of the screen (the court)
-        // Convert world meters -> NDC using uniform scale so the whole court fits
-        glUseProgram(shaderProgram);
-        float rect_w_ndc = WORLD_W * NDC_SCALE;
-        float rect_h_ndc = WORLD_H * NDC_SCALE;
-        renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
-        
-        // Render the net splitting the court in half (vertical line at x=0)
-        glUseProgram(netShaderProgram);
-        renderNet(world_to_ndc_x(0.0f), world_to_ndc_y(rectHalfHeight), world_to_ndc_y(-rectHalfHeight), world_to_ndc_scale(0.01f));
-        
-        // Render air particles (now moving, small circles)
-        glUseProgram(airParticleShaderProgram);
-        for (size_t i = 0; i < airParticles.size(); i++) {
-            renderCircle(world_to_ndc_x(airParticles[i].x), world_to_ndc_y(airParticles[i].y), world_to_ndc_scale(airParticleRadius), 16);
-        }
-        
-        // Render a circle (ball) inside the rectangle at its current position
-        glUseProgram(circleShaderProgram);
-        renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(circleRadius), 32);
-
-        // Render the ball path as a thin red line (GL_LINE_STRIP) if enabled
-        if (showPath && ballPath.size() >= 2 && pathShaderProgram != 0) {
-            glUseProgram(pathShaderProgram);
-            std::vector<float> pathVerts;
-            pathVerts.reserve(ballPath.size() * 2);
-            for (const auto &pt : ballPath) {
-                pathVerts.push_back(pt.first);
-                pathVerts.push_back(pt.second);
+            // Continuous Magnus effect: add a lateral acceleration proportional to (omega x v)
+            // Simple 2D approximation: F_magnus = k_magnus * (omega x v), where omega is scalar
+            // In 2D: omega x v = (-omega * v.y, omega * v.x)
+            // a = F / m -> velocity update: v += (k_magnus * (omega x v) / m) * dt
+            {
+                ScopedTimer timer_magnus("physics_magnus");
+                const float k_magnus = 0.0005f; // tune this constant to change effect strength
+                // Compute magnus acceleration components
+                float magnusAx = k_magnus * (-circleSpin * circleVelY) / ballMass;
+                float magnusAy = k_magnus * ( circleSpin * circleVelX) / ballMass;
+                // Integrate into velocity
+                circleVelX += magnusAx * timestepSize;
+                circleVelY += magnusAy * timestepSize;
             }
 
-            unsigned int pathVAO, pathVBO;
-            glGenVertexArrays(1, &pathVAO);
-            glBindVertexArray(pathVAO);
-
-            glGenBuffers(1, &pathVBO);
-            glBindBuffer(GL_ARRAY_BUFFER, pathVBO);
-            glBufferData(GL_ARRAY_BUFFER, pathVerts.size() * sizeof(float), pathVerts.data(), GL_STATIC_DRAW);
-
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-            glEnableVertexAttribArray(0);
-
-            glLineWidth(1.5f);
-            glDrawArrays(GL_LINE_STRIP, 0, (GLsizei)ballPath.size());
-
-            glDeleteBuffers(1, &pathVBO);
-            glDeleteVertexArrays(1, &pathVAO);
-        }
+            }
+        } // end physics_total scope
         
+        // Clear the screen and render (timed)
+        {
+            ScopedTimer timer_render("render_total", timestep);
+            glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
+            glClear(GL_COLOR_BUFFER_BIT);
+        
+            // Render a rectangle at the center of the screen (the court)
+            // Convert world meters -> NDC using uniform scale so the whole court fits
+            glUseProgram(shaderProgram);
+            float rect_w_ndc = WORLD_W * NDC_SCALE;
+            float rect_h_ndc = WORLD_H * NDC_SCALE;
+            renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
+            
+            // Render the net splitting the court in half (vertical line at x=0)
+            glUseProgram(netShaderProgram);
+            renderNet(world_to_ndc_x(0.0f), world_to_ndc_y(rectHalfHeight), world_to_ndc_y(-rectHalfHeight), world_to_ndc_scale(0.01f));
+            
+            // Render air particles (now moving, small circles)
+            glUseProgram(airParticleShaderProgram);
+            for (size_t i = 0; i < airParticles.size(); i++) {
+                renderCircle(world_to_ndc_x(airParticles[i].x), world_to_ndc_y(airParticles[i].y), world_to_ndc_scale(airParticleRadius), 16);
+            }
+
+            // Render a circle (ball) inside the rectangle at its current position
+            glUseProgram(circleShaderProgram);
+            renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(circleRadius), 32);
+
+            // Render the ball path as a thin red line (GL_LINE_STRIP) if enabled
+            if (showPath && ballPath.size() >= 2 && pathShaderProgram != 0) {
+                glUseProgram(pathShaderProgram);
+                std::vector<float> pathVerts;
+                pathVerts.reserve(ballPath.size() * 2);
+                for (const auto &pt : ballPath) {
+                    pathVerts.push_back(pt.first);
+                    pathVerts.push_back(pt.second);
+                }
+
+                unsigned int pathVAO, pathVBO;
+                glGenVertexArrays(1, &pathVAO);
+                glBindVertexArray(pathVAO);
+
+                glGenBuffers(1, &pathVBO);
+                glBindBuffer(GL_ARRAY_BUFFER, pathVBO);
+                glBufferData(GL_ARRAY_BUFFER, pathVerts.size() * sizeof(float), pathVerts.data(), GL_STATIC_DRAW);
+
+                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray(0);
+
+                glLineWidth(1.5f);
+                glDrawArrays(GL_LINE_STRIP, 0, (GLsizei)ballPath.size());
+
+                glDeleteBuffers(1, &pathVBO);
+                glDeleteVertexArrays(1, &pathVAO);
+            }
+        }
+
         // Update an on-screen HUD via the window title with ball position, velocity, spin, dspin and timestepSize
         {
             std::ostringstream oss;
@@ -901,6 +1007,9 @@ int main(int argc, char** argv) {
         glfwPollEvents();
     }
 
+    // Print totals before entering the pause/keep-open loop
+    print_timing_totals();
+
     while(1){
         // Keep window open after simulation ends
         if (glfwWindowShouldClose(window)) {
@@ -908,7 +1017,7 @@ int main(int argc, char** argv) {
         }
         glfwPollEvents();
     }
-    
+
     // Cleanup
     glDeleteProgram(shaderProgram);
     glDeleteProgram(circleShaderProgram);
@@ -918,5 +1027,6 @@ int main(int argc, char** argv) {
     glfwTerminate();
     
     return 0;
+
 }
 

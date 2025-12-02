@@ -30,6 +30,12 @@ RENDERER_CXXFLAGS += $(shell pkg-config --cflags glfw3)
 RENDERER_CXX ?= g++
 RENDERER_CXXFLAGS ?= -Wall -Wextra -O3 -std=c++17 -I./src
 
+# If you want to enable the DEBUG timing code in renderer.cpp, call make
+# with DEBUG=1. That adds -DDEBUG (and handy debug flags) to the compile line.
+ifeq ($(DEBUG),1)
+RENDERER_CXXFLAGS += -DDEBUG -g -O0
+endif
+
 .PHONY: all clean run format renderer run-renderer
 
 all: $(TARGET)
