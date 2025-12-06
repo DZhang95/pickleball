@@ -754,6 +754,15 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     // then the GPU already handled ball-particle collisions and we can skip the CPU code.
     // Otherwise (CUDA not requested or GPU run failed), fall back to the CPU collision code.
     if (!use_cuda_requested) {
+    // Accumulate impulses applied to the ball this timestep so we can apply
+    // them once at the end (matches CUDA path semantics and avoids order-dependence).
+    double acc_ball_imp_x = 0.0;
+    double acc_ball_imp_y = 0.0;
+    double acc_ball_spin = 0.0;
+    // Save pre-collision ball state for debug comparison
+    float pre_ball_vx = circleVelX;
+    float pre_ball_vy = circleVelY;
+    float pre_ball_spin = circleSpin;
         for (size_t i = 0; i < airParticles.size(); i++) {
             AirParticle& particle = airParticles[i];
 
@@ -815,23 +824,30 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
                     impulseX *= IMPULSE_SCALE_FACTOR;
                     impulseY *= IMPULSE_SCALE_FACTOR;
 
-                    // Apply impulse: ball should be pushed AWAY from the contacting particle.
-                    // Our normal n points from ball -> particle, so the ball receives -J*n
-                    circleVelX -= impulseX / BALL_MASS;
-                    circleVelY -= impulseY / BALL_MASS;
-
-                    float r_cross_J = rx * impulseY - ry * impulseX;
-                    float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
-                    // Because the ball receives -J, the spin change applied to the ball is -spin_change
-                    circleSpin -= spin_change;
-                    spinDeltaAccumulator -= spin_change;
-
                     // Particle should be pushed away from the ball: particle velocity increases by +J/m
                     particle.velX += impulseX / particle.mass;
                     particle.velY += impulseY / particle.mass;
+
+                    // Accumulate the equal-and-opposite impulse & spin for the ball (ball receives -J*n)
+                    acc_ball_imp_x += - (double)impulseX;
+                    acc_ball_imp_y += - (double)impulseY;
+
+                    float r_cross_J = rx * impulseY - ry * impulseX;
+                    float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
+                    acc_ball_spin += - (double)spin_change;
                 }
             }
         }
+
+        // Apply accumulated changes to ball velocity and spin once per timestep
+        if (acc_ball_imp_x != 0.0 || acc_ball_imp_y != 0.0) {
+            circleVelX += (float)(acc_ball_imp_x / BALL_MASS);
+            circleVelY += (float)(acc_ball_imp_y / BALL_MASS);
+        }
+        if (acc_ball_spin != 0.0) {
+            circleSpin += (float)acc_ball_spin;
+            spinDeltaAccumulator += (float)acc_ball_spin;
+        }        
 
         // Check collisions with rectangle boundaries for ball
         if (!allowBallEscape) {
