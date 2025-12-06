@@ -176,6 +176,20 @@ __global__ void kernel_physics_step(
             newx += sepX;
             newy += sepY;
 
+            // Project to exactly non-penetrating position (small eps) to avoid immediate re-contact
+            const float proj_eps = 1e-5f;
+            newx = ballX + nx * (ballMinDistance + proj_eps);
+            newy = ballY + ny * (ballMinDistance + proj_eps);
+
+            // Clamp the normal component of particle velocity so it's not still moving into the ball
+            float surfaceVelX_after = ballVelX - ballSpin * ry;
+            float surfaceVelY_after = ballVelY + ballSpin * rx;
+            float new_rel_vn = (vxi - surfaceVelX_after) * nx + (vyi - surfaceVelY_after) * ny;
+            if (new_rel_vn < 0.0f) {
+                vxi -= new_rel_vn * nx;
+                vyi -= new_rel_vn * ny;
+            }
+
             float r_cross_J = rx * impulseY - ry * impulseX;
             float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA_CU;
 

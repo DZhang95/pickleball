@@ -97,7 +97,7 @@ float rectHalfHeight = WORLD_H * 0.5f;   // half-width
 
 // Physics constants
 const float BALL_MASS = 0.026f;  // kg (26g)
-const float AIR_PARCEL_MASS = 0.0001f;  // kg (0.1g) - represents many air molecules
+const float AIR_PARCEL_MASS = 0.00000001f;  // Mass that represents many air molecules
 const float BALL_RADIUS = 0.185f;
 const float BALL_MOMENT_OF_INERTIA = (2.0f / 5.0f) * BALL_MASS * BALL_RADIUS * BALL_RADIUS;
 
@@ -133,6 +133,8 @@ const bool allowAirEscape = true;
 // Path trace: store recent ball center positions in NDC space (only used if showPath)
 std::vector<std::pair<float,float>> ballPath;
 const size_t maxPathPoints = 5000; // cap to avoid unbounded growth
+// Simulation frame counter for diagnostics
+static int g_simFrame = 0;
 // **************************************    
 
 // Function to compile shader
@@ -610,9 +612,16 @@ void initializeAirParticles(std::vector<AirParticle> &airParticles) {
     float windSpeed = sqrtf(WIND_VELOCITY_X * WIND_VELOCITY_X + WIND_VELOCITY_Y * WIND_VELOCITY_Y);
     
     // Generate random positions and velocities for air particles within the court
+    // Ensure no particle is initially placed overlapping the ball.
     for (int i = 0; i < numAirParticles; i++) {
-        float x = xDist(gen);
-        float y = yDist(gen);
+        float x, y;
+        // Resample until the particle lies outside the ball's radius + particle radius
+        float minDist = BALL_RADIUS + airParticleRadius + 1e-6f;
+        float minDist2 = minDist * minDist;
+        do {
+            x = xDist(gen);
+            y = yDist(gen);
+        } while ((x - circleX) * (x - circleX) + (y - circleY) * (y - circleY) < minDist2);
         
         // Set initial velocity based on wind
         float vx, vy;
@@ -641,6 +650,9 @@ void initializeAirParticles(std::vector<AirParticle> &airParticles) {
 // currently uses the CPU path.
 void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bool use_cuda_requested, float &spinDeltaAccumulator, bool showPath) {
     ScopedTimer timer_physics("physics_total", timestep);
+
+    // Increment the simulation frame counter for diagnostics
+    g_simFrame++;
 
     // Update ball position based on velocity
     circleX += circleVelX * timestepSize;
@@ -763,6 +775,12 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     float pre_ball_vx = circleVelX;
     float pre_ball_vy = circleVelY;
     float pre_ball_spin = circleSpin;
+
+    // Diagnostics: count collisions and sum absolute impulse magnitudes
+    int collisionCount = 0;
+    double sumJn = 0.0;
+    int sampleLogged = 0;
+    const int sampleMax = 8;
         for (size_t i = 0; i < airParticles.size(); i++) {
             AirParticle& particle = airParticles[i];
 
@@ -835,6 +853,29 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
                     float r_cross_J = rx * impulseY - ry * impulseX;
                     float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
                     acc_ball_spin += - (double)spin_change;
+
+                    // PROJECT to exactly non-penetrating position (small eps) to avoid immediate re-contact
+                    const float proj_eps = 1e-5f;
+                    particle.x = circleX + nx * (minDistance + proj_eps);
+                    particle.y = circleY + ny * (minDistance + proj_eps);
+
+                    // Clamp the normal component of particle velocity so it's not still moving into the ball
+                    float surfaceVelX_after = circleVelX - circleSpin * ry;
+                    float surfaceVelY_after = circleVelY + circleSpin * rx;
+                    float new_rel_vn = (particle.velX - surfaceVelX_after) * nx + (particle.velY - surfaceVelY_after) * ny;
+                    if (new_rel_vn < 0.0f) {
+                        // remove the inward component from particle velocity
+                        particle.velX -= new_rel_vn * nx;
+                        particle.velY -= new_rel_vn * ny;
+                    }
+
+                    // Diagnostics: count and sum magnitudes; sample a few Jn values
+                    collisionCount++;
+                    sumJn += fabs((double)Jn_mag);
+                    if (sampleLogged < sampleMax) {
+                        std::cerr << "DIAG_COLL: frame=" << g_simFrame << " idx=" << i << " Jn=" << Jn_mag << " partMass=" << particle.mass << " v_rel_n=" << v_rel_n << std::endl;
+                        sampleLogged++;
+                    }
                 }
             }
         }
@@ -849,6 +890,8 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             spinDeltaAccumulator += (float)acc_ball_spin;
         }        
 
+        // Diagnostics summary for this timestep
+        std::cerr << "DIAG_SUM: frame=" << g_simFrame << " collisions=" << collisionCount << " sumAbsJn=" << sumJn << " acc_imp_x=" << acc_ball_imp_x << " acc_imp_y=" << acc_ball_imp_y << " delta_v_x=" << (acc_ball_imp_x / BALL_MASS) << " delta_v_y=" << (acc_ball_imp_y / BALL_MASS) << std::endl;
         // Check collisions with rectangle boundaries for ball
         if (!allowBallEscape) {
             if (circleX - BALL_RADIUS <= -rectHalfWidth) {
@@ -1016,6 +1059,34 @@ int main(int argc, char** argv) {
                 }
             } else {
                 std::cerr << "--particle-count requires an integer argument; ignoring" << std::endl;
+            }
+            continue;
+        }
+        // Optional CLI overrides for initial ball state
+        if (std::strcmp(argv[ai], "--ball-vx") == 0) {
+            if (ai + 1 < argc) {
+                circleVelX = std::atof(argv[++ai]);
+                std::cerr << "Setting initial circleVelX to " << circleVelX << "\n";
+            } else {
+                std::cerr << "--ball-vx requires a numeric argument; ignoring" << std::endl;
+            }
+            continue;
+        }
+        if (std::strcmp(argv[ai], "--ball-vy") == 0) {
+            if (ai + 1 < argc) {
+                circleVelY = std::atof(argv[++ai]);
+                std::cerr << "Setting initial circleVelY to " << circleVelY << "\n";
+            } else {
+                std::cerr << "--ball-vy requires a numeric argument; ignoring" << std::endl;
+            }
+            continue;
+        }
+        if (std::strcmp(argv[ai], "--ball-spin") == 0) {
+            if (ai + 1 < argc) {
+                circleSpin = std::atof(argv[++ai]);
+                std::cerr << "Setting initial circleSpin to " << circleSpin << "\n";
+            } else {
+                std::cerr << "--ball-spin requires a numeric argument; ignoring" << std::endl;
             }
             continue;
         }
