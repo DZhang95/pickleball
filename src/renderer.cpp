@@ -103,7 +103,7 @@ const float BALL_MOMENT_OF_INERTIA = (2.0f / 5.0f) * BALL_MASS * BALL_RADIUS * B
 
 float airParticleRadius = 0.005f;
 
-const float IMPULSE_SCALE_FACTOR = 1;  // Can scale down impulses
+const float IMPULSE_SCALE_FACTOR = 0.1f;  // Can scale down impulses
 const float AIR_AIR_IMPULSE_SCALE_FACTOR = 0.1f;
 
 // Wind parameters (wind velocity in m/s)

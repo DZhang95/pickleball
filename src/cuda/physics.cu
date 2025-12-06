@@ -12,10 +12,10 @@ static inline void printCudaError(const char *where, cudaError_t err) {
 
 // Duplicate a few physics constants to keep the CUDA code self-contained.
 static const float BALL_MASS_CU = 0.026f;
-static const float AIR_PARCEL_MASS_CU = 0.0001f;
+static const float AIR_PARCEL_MASS_CU = 0.00000001f;
 static const float BALL_RADIUS_CU = 0.185f;
 static const float BALL_MOMENT_OF_INERTIA_CU = (2.0f / 5.0f) * BALL_MASS_CU * BALL_RADIUS_CU * BALL_RADIUS_CU;
-static const float IMPULSE_SCALE_FACTOR_CU = 1.0f;
+static const float IMPULSE_SCALE_FACTOR_CU = 0.1f;
 static const float AIR_AIR_IMPULSE_SCALE_FACTOR_CU = 0.1f;
 
 // Persistent device buffers
