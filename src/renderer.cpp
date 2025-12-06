@@ -58,7 +58,7 @@ const char* netFragmentShaderSource =
 "out vec4 FragColor;\n"
 "\n"
 "void main() {\n"
-"    FragColor = vec4(1.0f, 1.0f, 1.0f, 1.0f);\n"
+"    FragColor = vec4(0.0f, 0.0f, 0.0f, 1.0f);\n"
 "}\n";
 
 // Fragment shader source code for air particles (light gray)
@@ -335,7 +335,8 @@ void renderRectangle(float centerX, float centerY, float width, float height) {
 }
 
 // Function to render a net (vertical line splitting the court)
-void renderNet(float centerX, float topY, float bottomY, float lineWidth) {
+// Parameters: centerX, bottomY, topY, lineWidth (bottom before top - matches vertex ordering)
+void renderNet(float centerX, float bottomY, float topY, float lineWidth) {
     // Render the net as a vertical line made of a thin rectangle
     float halfWidth = lineWidth / 2.0f;
     
@@ -1009,7 +1010,18 @@ int main(int argc, char** argv) {
             
             // Render the net splitting the court in half (vertical line at x=0)
             glUseProgram(shaders.netShader);
-            renderNet(world_to_ndc_x(0.0f), world_to_ndc_y(rectHalfHeight), world_to_ndc_y(-rectHalfHeight), world_to_ndc_scale(0.01f));
+            // Draw net with a thickness of ~3 pixels (framebuffer-aware)
+            {
+                int fbW, fbH;
+                glfwGetFramebufferSize(window, &fbW, &fbH);
+                // pixels per NDC unit: fbW / 2 (since NDC spans [-1,1])
+                float pixels_per_ndc = (fbW > 0) ? (fbW / 2.0f) : 600.0f;
+                const float desired_pixels = 3.0f;
+                // net width in NDC units
+                float net_ndc_width = desired_pixels / pixels_per_ndc;
+                // pass bottomY then topY to match renderNet signature (bottom before top)
+                renderNet(world_to_ndc_x(0.0f), world_to_ndc_y(-rectHalfHeight), world_to_ndc_y(rectHalfHeight), net_ndc_width);
+            }
             
             // Render air particles (now moving, small circles)
             glUseProgram(shaders.airParticleShader);
@@ -1102,6 +1114,5 @@ int main(int argc, char** argv) {
     cleanup(window, shaders);
     
     return 0;
-
 }
 
