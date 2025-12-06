@@ -95,9 +95,6 @@ const float NDC_SCALE = std::min(2.0f / WORLD_W, 2.0f / WORLD_H);
 float rectHalfWidth = WORLD_W * 0.5f; // half-length
 float rectHalfHeight = WORLD_H * 0.5f;   // half-width
 
-// Generate air particles (now with velocities for collision response)
-const int numAirParticles = 3000;
-
 // Physics constants
 const float BALL_MASS = 0.026f;  // kg (26g)
 const float AIR_PARCEL_MASS = 0.0001f;  // kg (0.1g) - represents many air molecules
@@ -121,6 +118,8 @@ const float timestepSize = 0.001f;  // 0.001s time step
 // **************************************    
 
 // ******** Other Globals ********
+// Generate air particles
+int numAirParticles = 3000;
 // Circle initial position and velocity
 float circleX = -4.0f;
 float circleY = -2.0f;
@@ -656,194 +655,242 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
         }
     }
 
-    // Update air particle positions (CPU fallback)
-    for (size_t i = 0; i < airParticles.size(); i++) {
-        airParticles[i].x += airParticles[i].velX * timestepSize;
-        airParticles[i].y += airParticles[i].velY * timestepSize;
+    // If CUDA requested, attempt to run the whole particle-step + ball-particle collisions on GPU.
+    // Track whether the GPU actually completed the work successfully (gpu_ok). If it fails
+    // we must still perform the CPU ball-particle collision step later.
+    bool gpu_ok = false;
+    if (use_cuda_requested) {
+        int n = (int)airParticles.size();
+        std::vector<float> px(n), py(n), pvx(n), pvy(n);
+        for (int i = 0; i < n; ++i) {
+            px[i] = airParticles[i].x;
+            py[i] = airParticles[i].y;
+            pvx[i] = airParticles[i].velX;
+            pvy[i] = airParticles[i].velY;
+        }
+
+        // ballState: [circleX, circleY, circleVelX, circleVelY, circleSpin]
+        float ballState[5] = { circleX, circleY, circleVelX, circleVelY, circleSpin };
+
+        bool ok = cuda_physics_run(px.data(), py.data(), pvx.data(), pvy.data(), n, ballState, (float)timestepSize);
+        if (ok) {
+            // copy back particle arrays
+            for (int i = 0; i < n; ++i) {
+                airParticles[i].x = px[i];
+                airParticles[i].y = py[i];
+                airParticles[i].velX = pvx[i];
+                airParticles[i].velY = pvy[i];
+            }
+            // Update ball velocities and spin from returned state (positions are handled on host)
+            circleVelX = ballState[2];
+            circleVelY = ballState[3];
+            circleSpin = ballState[4];
+            gpu_ok = true;
+        } else {
+            // If GPU run failed, fall back to CPU integration for this small step
+            for (size_t i = 0; i < airParticles.size(); i++) {
+                airParticles[i].x += airParticles[i].velX * timestepSize;
+                airParticles[i].y += airParticles[i].velY * timestepSize;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            airParticles[i].x += airParticles[i].velX * timestepSize;
+            airParticles[i].y += airParticles[i].velY * timestepSize;
+        }
     }
 
     // Check for collisions between air particles (AIR-AIR collisions)
-    for (size_t i = 0; i < airParticles.size(); i++) {
-        for (size_t j = i + 1; j < airParticles.size(); j++) {
-            AirParticle& particle1 = airParticles[i];
-            AirParticle& particle2 = airParticles[j];
+    // If GPU did the physics step successfully (gpu_ok) then the GPU already handled
+    // air-air collisions; otherwise run the CPU fallback.
+    if (!use_cuda_requested || !gpu_ok) {
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            for (size_t j = i + 1; j < airParticles.size(); j++) {
+                AirParticle& particle1 = airParticles[i];
+                AirParticle& particle2 = airParticles[j];
 
-            float dx = particle2.x - particle1.x;
-            float dy = particle2.y - particle1.y;
+                float dx = particle2.x - particle1.x;
+                float dy = particle2.y - particle1.y;
+                float distance = sqrtf(dx * dx + dy * dy);
+                float minDistance = 2.0f * airParticleRadius;
+
+                if (distance < minDistance && distance > 0.0001f) {
+                    float nx = dx / distance;
+                    float ny = dy / distance;
+
+                    float overlap = minDistance - distance;
+                    float separationX = nx * overlap * 0.5f;
+                    float separationY = ny * overlap * 0.5f;
+
+                    particle1.x -= separationX;
+                    particle1.y -= separationY;
+                    particle2.x += separationX;
+                    particle2.y += separationY;
+
+                    float relVelX = particle2.velX - particle1.velX;
+                    float relVelY = particle2.velY - particle1.velY;
+
+                    float v_rel_dot_n = relVelX * nx + relVelY * ny;
+                    float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
+                    float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
+
+                    impulseX *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+                    impulseY *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+
+                    particle1.velX += impulseX / AIR_PARCEL_MASS;
+                    particle1.velY += impulseY / AIR_PARCEL_MASS;
+                    particle2.velX -= impulseX / AIR_PARCEL_MASS;
+                    particle2.velY -= impulseY / AIR_PARCEL_MASS;
+                }
+            }
+        }
+    }
+
+    // Check for collisions between ball and air particles.
+    // If CUDA was requested and successfully performed the whole physics step (gpu_ok==true)
+    // then the GPU already handled ball-particle collisions and we can skip the CPU code.
+    // Otherwise (CUDA not requested or GPU run failed), fall back to the CPU collision code.
+    if (!use_cuda_requested || !gpu_ok) {
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            AirParticle& particle = airParticles[i];
+
+            float dx = particle.x - circleX;
+            float dy = particle.y - circleY;
             float distance = sqrtf(dx * dx + dy * dy);
-            float minDistance = 2.0f * airParticleRadius;
+            float minDistance = BALL_RADIUS + airParticleRadius;
 
             if (distance < minDistance && distance > 0.0001f) {
-                float nx = dx / distance;
-                float ny = dy / distance;
+                float r_mag = sqrtf(dx * dx + dy * dy);
+                float nx = dx / r_mag;
+                float ny = dy / r_mag;
+
+                float rx = nx * BALL_RADIUS;
+                float ry = ny * BALL_RADIUS;
 
                 float overlap = minDistance - distance;
                 float separationX = nx * overlap * 0.5f;
                 float separationY = ny * overlap * 0.5f;
 
-                particle1.x -= separationX;
-                particle1.y -= separationY;
-                particle2.x += separationX;
-                particle2.y += separationY;
+                float totalMass = BALL_MASS + particle.mass;
+                circleX -= separationX * (particle.mass / totalMass);
+                circleY -= separationY * (particle.mass / totalMass);
+                particle.x += separationX * (BALL_MASS / totalMass);
+                particle.y += separationY * (BALL_MASS / totalMass);
 
-                float relVelX = particle2.velX - particle1.velX;
-                float relVelY = particle2.velY - particle1.velY;
+                float surfaceVelX = circleVelX - circleSpin * ry;
+                float surfaceVelY = circleVelY + circleSpin * rx;
 
-                float v_rel_dot_n = relVelX * nx + relVelY * ny;
-                float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
-                float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
+                float relVelX = particle.velX - surfaceVelX;
+                float relVelY = particle.velY - surfaceVelY;
 
-                impulseX *= AIR_AIR_IMPULSE_SCALE_FACTOR;
-                impulseY *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+                float v_rel_n = relVelX * nx + relVelY * ny;
+                if (v_rel_n < 0.0f) {
+                    float invMassBall = 1.0f / BALL_MASS;
+                    float invMassPart = 1.0f / particle.mass;
 
-                particle1.velX += impulseX / AIR_PARCEL_MASS;
-                particle1.velY += impulseY / AIR_PARCEL_MASS;
-                particle2.velX -= impulseX / AIR_PARCEL_MASS;
-                particle2.velY -= impulseY / AIR_PARCEL_MASS;
+                    const float restitution = 0.0f;
+                    float Jn_mag = -(1.0f + restitution) * v_rel_n / (invMassBall + invMassPart);
+
+                    float tx = -ny;
+                    float ty = nx;
+                    float v_rel_t = relVelX * tx + relVelY * ty;
+
+                    float denom_t = invMassBall + invMassPart + (BALL_RADIUS * BALL_RADIUS) / BALL_MOMENT_OF_INERTIA;
+                    float Jt_unc = - v_rel_t / denom_t;
+
+                    const float mu = 0.05f;
+                    float Jt = 0.0f;
+                    if (fabsf(Jt_unc) <= mu * Jn_mag) {
+                        Jt = Jt_unc;
+                    } else {
+                        Jt = (Jt_unc > 0.0f ? 1.0f : -1.0f) * mu * Jn_mag;
+                    }
+
+                    float impulseX = Jn_mag * nx + Jt * tx;
+                    float impulseY = Jn_mag * ny + Jt * ty;
+
+                    impulseX *= IMPULSE_SCALE_FACTOR;
+                    impulseY *= IMPULSE_SCALE_FACTOR;
+
+                    circleVelX += impulseX / BALL_MASS;
+                    circleVelY += impulseY / BALL_MASS;
+
+                    float r_cross_J = rx * impulseY - ry * impulseX;
+                    float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
+                    circleSpin += spin_change;
+                    spinDeltaAccumulator += spin_change;
+
+                    particle.velX -= impulseX / particle.mass;
+                    particle.velY -= impulseY / particle.mass;
+                }
             }
         }
-    }
 
-    // Check for collisions between ball and air particles
-    for (size_t i = 0; i < airParticles.size(); i++) {
-        AirParticle& particle = airParticles[i];
+        // Check collisions with rectangle boundaries for ball
+        if (!allowBallEscape) {
+            if (circleX - BALL_RADIUS <= -rectHalfWidth) {
+                circleX = -rectHalfWidth + BALL_RADIUS;
+                circleVelX = -circleVelX;
+            }
+            if (circleX + BALL_RADIUS >= rectHalfWidth) {
+                circleX = rectHalfWidth - BALL_RADIUS;
+                circleVelX = -circleVelX;
+            }
+            if (circleY - BALL_RADIUS <= -rectHalfHeight) {
+                circleY = -rectHalfHeight + BALL_RADIUS;
+                circleVelY = -circleVelY;
+            }
+            if (circleY + BALL_RADIUS >= rectHalfHeight) {
+                circleY = rectHalfHeight - BALL_RADIUS;
+                circleVelY = -circleVelY;
+            }
+        }
 
-        float dx = particle.x - circleX;
-        float dy = particle.y - circleY;
-        float distance = sqrtf(dx * dx + dy * dy);
-        float minDistance = BALL_RADIUS + airParticleRadius;
+        // Check for collisions with rectangle boundaries (air particles)
+        for (size_t i = 0; i < airParticles.size(); ) {
+            AirParticle& particle = airParticles[i];
 
-        if (distance < minDistance && distance > 0.0001f) {
-            float r_mag = sqrtf(dx * dx + dy * dy);
-            float nx = dx / r_mag;
-            float ny = dy / r_mag;
-
-            float rx = nx * BALL_RADIUS;
-            float ry = ny * BALL_RADIUS;
-
-            float overlap = minDistance - distance;
-            float separationX = nx * overlap * 0.5f;
-            float separationY = ny * overlap * 0.5f;
-
-            float totalMass = BALL_MASS + particle.mass;
-            circleX -= separationX * (particle.mass / totalMass);
-            circleY -= separationY * (particle.mass / totalMass);
-            particle.x += separationX * (BALL_MASS / totalMass);
-            particle.y += separationY * (BALL_MASS / totalMass);
-
-            float surfaceVelX = circleVelX - circleSpin * ry;
-            float surfaceVelY = circleVelY + circleSpin * rx;
-
-            float relVelX = particle.velX - surfaceVelX;
-            float relVelY = particle.velY - surfaceVelY;
-
-            float v_rel_n = relVelX * nx + relVelY * ny;
-            if (v_rel_n < 0.0f) {
-                float invMassBall = 1.0f / BALL_MASS;
-                float invMassPart = 1.0f / particle.mass;
-
-                const float restitution = 0.0f;
-                float Jn_mag = -(1.0f + restitution) * v_rel_n / (invMassBall + invMassPart);
-
-                float tx = -ny;
-                float ty = nx;
-                float v_rel_t = relVelX * tx + relVelY * ty;
-
-                float denom_t = invMassBall + invMassPart + (BALL_RADIUS * BALL_RADIUS) / BALL_MOMENT_OF_INERTIA;
-                float Jt_unc = - v_rel_t / denom_t;
-
-                const float mu = 0.05f;
-                float Jt = 0.0f;
-                if (fabsf(Jt_unc) <= mu * Jn_mag) {
-                    Jt = Jt_unc;
-                } else {
-                    Jt = (Jt_unc > 0.0f ? 1.0f : -1.0f) * mu * Jn_mag;
+            if (!allowAirEscape) {
+                if (particle.x - airParticleRadius <= -rectHalfWidth) {
+                    particle.x = -rectHalfWidth + airParticleRadius;
+                    particle.velX = -particle.velX;
+                }
+                if (particle.x + airParticleRadius >= rectHalfWidth) {
+                    particle.x = rectHalfWidth - airParticleRadius;
+                    particle.velX = -particle.velX;
+                }
+                if (particle.y - airParticleRadius <= -rectHalfHeight) {
+                    particle.y = -rectHalfHeight + airParticleRadius;
+                    particle.velY = -particle.velY;
+                }
+                if (particle.y + airParticleRadius >= rectHalfHeight) {
+                    particle.y = rectHalfHeight - airParticleRadius;
+                    particle.velY = -particle.velY;
                 }
 
-                float impulseX = Jn_mag * nx + Jt * tx;
-                float impulseY = Jn_mag * ny + Jt * ty;
-
-                impulseX *= IMPULSE_SCALE_FACTOR;
-                impulseY *= IMPULSE_SCALE_FACTOR;
-
-                circleVelX += impulseX / BALL_MASS;
-                circleVelY += impulseY / BALL_MASS;
-
-                float r_cross_J = rx * impulseY - ry * impulseX;
-                float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
-                circleSpin += spin_change;
-                spinDeltaAccumulator += spin_change;
-
-                particle.velX -= impulseX / particle.mass;
-                particle.velY -= impulseY / particle.mass;
-            }
-        }
-    }
-
-    // Check collisions with rectangle boundaries for ball
-    if (!allowBallEscape) {
-        if (circleX - BALL_RADIUS <= -rectHalfWidth) {
-            circleX = -rectHalfWidth + BALL_RADIUS;
-            circleVelX = -circleVelX;
-        }
-        if (circleX + BALL_RADIUS >= rectHalfWidth) {
-            circleX = rectHalfWidth - BALL_RADIUS;
-            circleVelX = -circleVelX;
-        }
-        if (circleY - BALL_RADIUS <= -rectHalfHeight) {
-            circleY = -rectHalfHeight + BALL_RADIUS;
-            circleVelY = -circleVelY;
-        }
-        if (circleY + BALL_RADIUS >= rectHalfHeight) {
-            circleY = rectHalfHeight - BALL_RADIUS;
-            circleVelY = -circleVelY;
-        }
-    }
-
-    // Check for collisions with rectangle boundaries (air particles)
-    for (size_t i = 0; i < airParticles.size(); ) {
-        AirParticle& particle = airParticles[i];
-
-        if (!allowAirEscape) {
-            if (particle.x - airParticleRadius <= -rectHalfWidth) {
-                particle.x = -rectHalfWidth + airParticleRadius;
-                particle.velX = -particle.velX;
-            }
-            if (particle.x + airParticleRadius >= rectHalfWidth) {
-                particle.x = rectHalfWidth - airParticleRadius;
-                particle.velX = -particle.velX;
-            }
-            if (particle.y - airParticleRadius <= -rectHalfHeight) {
-                particle.y = -rectHalfHeight + airParticleRadius;
-                particle.velY = -particle.velY;
-            }
-            if (particle.y + airParticleRadius >= rectHalfHeight) {
-                particle.y = rectHalfHeight - airParticleRadius;
-                particle.velY = -particle.velY;
-            }
-
-            ++i;
-        } else {
-            bool outsideLeft = (particle.x + airParticleRadius < -rectHalfWidth);
-            bool outsideRight = (particle.x - airParticleRadius > rectHalfWidth);
-            bool outsideBottom = (particle.y + airParticleRadius < -rectHalfHeight);
-            bool outsideTop = (particle.y - airParticleRadius > rectHalfHeight);
-
-            if (outsideLeft || outsideRight || outsideBottom || outsideTop) {
-                airParticles.erase(airParticles.begin() + i);
-            } else {
                 ++i;
+            } else {
+                bool outsideLeft = (particle.x + airParticleRadius < -rectHalfWidth);
+                bool outsideRight = (particle.x - airParticleRadius > rectHalfWidth);
+                bool outsideBottom = (particle.y + airParticleRadius < -rectHalfHeight);
+                bool outsideTop = (particle.y - airParticleRadius > rectHalfHeight);
+
+                if (outsideLeft || outsideRight || outsideBottom || outsideTop) {
+                    airParticles.erase(airParticles.begin() + i);
+                } else {
+                    ++i;
+                }
             }
         }
-    }
 
-    // Continuous Magnus effect
-    {
-        const float k_magnus = 0.0005f;
-        float magnusAx = k_magnus * (-circleSpin * circleVelY) / BALL_MASS;
-        float magnusAy = k_magnus * ( circleSpin * circleVelX) / BALL_MASS;
-        circleVelX += magnusAx * timestepSize;
-        circleVelY += magnusAy * timestepSize;
+        // Continuous Magnus effect
+        {
+            const float k_magnus = 0.0005f;
+            float magnusAx = k_magnus * (-circleSpin * circleVelY) / BALL_MASS;
+            float magnusAy = k_magnus * ( circleSpin * circleVelX) / BALL_MASS;
+            circleVelX += magnusAx * timestepSize;
+            circleVelY += magnusAy * timestepSize;
+        }
     }
 }
 
@@ -947,6 +994,15 @@ int main(int argc, char** argv) {
         
     std::vector<AirParticle> airParticles;
     initializeAirParticles(airParticles);
+    // If requested, try to initialize CUDA persistent buffers for physics
+    if (use_cuda_requested) {
+        if (!cuda_physics_init((int)airParticles.size())) {
+            std::cerr << "WARNING: cuda_physics_init failed; disabling CUDA path" << std::endl;
+            use_cuda_requested = false;
+        } else {
+            std::cerr << "INFO: cuda_physics_init succeeded for n=" << airParticles.size() << std::endl;
+        }
+    }
     
     // Main render loop
     float timestep = 0.0f;
@@ -1009,6 +1065,9 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
+    // Destroy CUDA persistent buffers if allocated
+    if (use_cuda_requested) cuda_physics_destroy();
+
     cleanup(window, shaders);
     
     return 0;
