@@ -847,6 +847,73 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     }
 }
 
+// Rendering function extracted from main loop. Renders the court, net, particles,
+// ball and optional path. Uses globals for world-to-NDC constants and ball state.
+void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParticle> &airParticles, double timestep, bool showPath) {
+    ScopedTimer timer_render("render_total", timestep);
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Render a rectangle at the center of the screen (the court)
+    glUseProgram(shaders.rectangleShader);
+    float rect_w_ndc = WORLD_W * NDC_SCALE;
+    float rect_h_ndc = WORLD_H * NDC_SCALE;
+    renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
+
+    // Render the net splitting the court in half (vertical line at x=0)
+    glUseProgram(shaders.netShader);
+    // Draw net with a thickness of ~3 pixels (framebuffer-aware)
+    {
+        int fbW, fbH;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+        float pixels_per_ndc = (fbW > 0) ? (fbW / 2.0f) : 600.0f;
+        const float desired_pixels = 3.0f;
+        float net_ndc_width = desired_pixels / pixels_per_ndc;
+        renderNet((0.0f - world_cx) * NDC_SCALE, ( -rectHalfHeight - world_cy) * NDC_SCALE, (rectHalfHeight - world_cy) * NDC_SCALE, net_ndc_width);
+    }
+
+    // Render air particles (now moving, small circles)
+    glUseProgram(shaders.airParticleShader);
+    for (size_t i = 0; i < airParticles.size(); i++) {
+        float px = (airParticles[i].x - world_cx) * NDC_SCALE;
+        float py = (airParticles[i].y - world_cy) * NDC_SCALE;
+        float pr = airParticleRadius * NDC_SCALE;
+        renderCircle(px, py, pr, 16);
+    }
+
+    // Render a circle (ball) inside the rectangle at its current position
+    glUseProgram(shaders.circleShader);
+    renderCircle((circleX - world_cx) * NDC_SCALE, (circleY - world_cy) * NDC_SCALE, BALL_RADIUS * NDC_SCALE, 32);
+
+    // Render the ball path as a thin red line (GL_LINE_STRIP) if enabled
+    if (showPath && ballPath.size() >= 2 && shaders.pathShader != 0) {
+        glUseProgram(shaders.pathShader);
+        std::vector<float> pathVerts;
+        pathVerts.reserve(ballPath.size() * 2);
+        for (const auto &pt : ballPath) {
+            pathVerts.push_back(pt.first);
+            pathVerts.push_back(pt.second);
+        }
+
+        unsigned int pathVAO, pathVBO;
+        glGenVertexArrays(1, &pathVAO);
+        glBindVertexArray(pathVAO);
+
+        glGenBuffers(1, &pathVBO);
+        glBindBuffer(GL_ARRAY_BUFFER, pathVBO);
+        glBufferData(GL_ARRAY_BUFFER, pathVerts.size() * sizeof(float), pathVerts.data(), GL_STATIC_DRAW);
+
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        glLineWidth(1.5f);
+        glDrawArrays(GL_LINE_STRIP, 0, (GLsizei)ballPath.size());
+
+        glDeleteBuffers(1, &pathVBO);
+        glDeleteVertexArrays(1, &pathVAO);
+    }
+}
+
 int main(int argc, char** argv) {
     // Parse command-line arguments
     bool showPath = false; // off by default
@@ -888,77 +955,10 @@ int main(int argc, char** argv) {
         // Accumulate spin changes for HUD/debugging this frame
         float spinDeltaAccumulator = 0.0f;
         // --- Physics section (timed) ---
-        {
-            // Call extracted physics function (includes its own timers)
-            simulatePhysics(timestep, airParticles, use_cuda_requested, spinDeltaAccumulator, showPath);
-        }
+        simulatePhysics(timestep, airParticles, use_cuda_requested, spinDeltaAccumulator, showPath);
         
         // Clear the screen and render (timed)
-        {
-            ScopedTimer timer_render("render_total", timestep);
-            glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
-            glClear(GL_COLOR_BUFFER_BIT);
-        
-            // Render a rectangle at the center of the screen (the court)
-            // Convert world meters -> NDC using uniform scale so the whole court fits
-            glUseProgram(shaders.rectangleShader);
-            float rect_w_ndc = WORLD_W * NDC_SCALE;
-            float rect_h_ndc = WORLD_H * NDC_SCALE;
-            renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
-            
-            // Render the net splitting the court in half (vertical line at x=0)
-            glUseProgram(shaders.netShader);
-            // Draw net with a thickness of ~3 pixels (framebuffer-aware)
-            {
-                int fbW, fbH;
-                glfwGetFramebufferSize(window, &fbW, &fbH);
-                // pixels per NDC unit: fbW / 2 (since NDC spans [-1,1])
-                float pixels_per_ndc = (fbW > 0) ? (fbW / 2.0f) : 600.0f;
-                const float desired_pixels = 3.0f;
-                // net width in NDC units
-                float net_ndc_width = desired_pixels / pixels_per_ndc;
-                // pass bottomY then topY to match renderNet signature (bottom before top)
-                renderNet(world_to_ndc_x(0.0f), world_to_ndc_y(-rectHalfHeight), world_to_ndc_y(rectHalfHeight), net_ndc_width);
-            }
-            
-            // Render air particles (now moving, small circles)
-            glUseProgram(shaders.airParticleShader);
-            for (size_t i = 0; i < airParticles.size(); i++) {
-                renderCircle(world_to_ndc_x(airParticles[i].x), world_to_ndc_y(airParticles[i].y), world_to_ndc_scale(airParticleRadius), 16);
-            }
-
-            // Render a circle (ball) inside the rectangle at its current position
-            glUseProgram(shaders.circleShader);
-            renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(BALL_RADIUS), 32);
-
-            // Render the ball path as a thin red line (GL_LINE_STRIP) if enabled
-            if (showPath && ballPath.size() >= 2 && shaders.pathShader != 0) {
-                glUseProgram(shaders.pathShader);
-                std::vector<float> pathVerts;
-                pathVerts.reserve(ballPath.size() * 2);
-                for (const auto &pt : ballPath) {
-                    pathVerts.push_back(pt.first);
-                    pathVerts.push_back(pt.second);
-                }
-
-                unsigned int pathVAO, pathVBO;
-                glGenVertexArrays(1, &pathVAO);
-                glBindVertexArray(pathVAO);
-
-                glGenBuffers(1, &pathVBO);
-                glBindBuffer(GL_ARRAY_BUFFER, pathVBO);
-                glBufferData(GL_ARRAY_BUFFER, pathVerts.size() * sizeof(float), pathVerts.data(), GL_STATIC_DRAW);
-
-                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-                glEnableVertexAttribArray(0);
-
-                glLineWidth(1.5f);
-                glDrawArrays(GL_LINE_STRIP, 0, (GLsizei)ballPath.size());
-
-                glDeleteBuffers(1, &pathVBO);
-                glDeleteVertexArrays(1, &pathVAO);
-            }
-        }
+        renderFrame(window, shaders, airParticles, timestep, showPath);
 
         // Update an on-screen HUD via the window title with ball position, velocity, spin, dspin and timestepSize
         {
