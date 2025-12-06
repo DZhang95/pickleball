@@ -354,25 +354,20 @@ struct AirParticle {
         : x(px), y(py), velX(vx), velY(vy), mass(m) {}
 };
 
-int main(int argc, char** argv) {
-    // Parse command-line arguments
-    bool showPath = false; // off by default
-    bool use_cuda_requested = false;
-    for (int ai = 1; ai < argc; ++ai) {
-        if (std::strcmp(argv[ai], "--trace-path") == 0 || std::strcmp(argv[ai], "-t") == 0 || std::strcmp(argv[ai], "--path") == 0) {
-            showPath = true;
-            break;
-        }
-        if (std::strcmp(argv[ai], "--use-cuda") == 0 || std::strcmp(argv[ai], "--cuda") == 0) {
-            use_cuda_requested = true;
-        }
-    }
-    // Quick sanity write to stderr so we can verify logging is captured
-    std::cerr << "TIMING: program_start" << std::endl;
-    // Initialize GLFW
+// World shaders structure to hold different shader programs
+struct WorldShaders {
+    unsigned int rectangleShader;
+    unsigned int circleShader;
+    unsigned int netShader;
+    unsigned int airParticleShader;
+    unsigned int pathShader;
+};
+
+GLFWwindow* gl_init(bool showPath, WorldShaders &shaders) {
+        // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
-        return -1;
+        throw std::runtime_error("Failed to initialize GLFW");
     }
     
     // Configure GLFW
@@ -393,7 +388,7 @@ int main(int argc, char** argv) {
     if (window == NULL) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
-        return -1;
+        throw std::runtime_error("Failed to create GLFW window");
     }
 
     glfwMakeContextCurrent(window);
@@ -402,7 +397,7 @@ int main(int argc, char** argv) {
     if (glewInit() != GLEW_OK) {
         std::cerr << "Failed to initialize GLEW" << std::endl;
         glfwTerminate();
-        return -1;
+        throw std::runtime_error("Failed to initialize GLEW");
     }
 #endif    
 
@@ -413,116 +408,112 @@ int main(int argc, char** argv) {
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     
     // Create shader program for rectangle
-    unsigned int shaderProgram = createShaderProgram();
-    if (shaderProgram == 0) {
+    shaders.rectangleShader = createShaderProgram();
+    if (shaders.rectangleShader == 0) {
         std::cerr << "Failed to create shader program" << std::endl;
         glfwTerminate();
-        return -1;
+        throw std::runtime_error("Failed to create shader program");
     }
     
     // Create shader program for circle (with different color)
     unsigned int vertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
     unsigned int circleFragmentShader = compileShader(GL_FRAGMENT_SHADER, circleFragmentShaderSource);
-    unsigned int circleShaderProgram = 0;
     if (vertexShader != 0 && circleFragmentShader != 0) {
-        circleShaderProgram = glCreateProgram();
-        glAttachShader(circleShaderProgram, vertexShader);
-        glAttachShader(circleShaderProgram, circleFragmentShader);
-        glLinkProgram(circleShaderProgram);
+        shaders.circleShader = glCreateProgram();
+        glAttachShader(shaders.circleShader, vertexShader);
+        glAttachShader(shaders.circleShader, circleFragmentShader);
+        glLinkProgram(shaders.circleShader);
         
         int success;
         char infoLog[512];
-        glGetProgramiv(circleShaderProgram, GL_LINK_STATUS, &success);
+        glGetProgramiv(shaders.circleShader, GL_LINK_STATUS, &success);
         if (!success) {
-            glGetProgramInfoLog(circleShaderProgram, 512, NULL, infoLog);
+            glGetProgramInfoLog(shaders.circleShader, 512, NULL, infoLog);
             std::cerr << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
-            circleShaderProgram = 0;
+            shaders.circleShader = 0;
         }
         glDeleteShader(vertexShader);
         glDeleteShader(circleFragmentShader);
     }
     
-    if (circleShaderProgram == 0) {
+    if (shaders.circleShader == 0) {
         std::cerr << "Failed to create circle shader program" << std::endl;
         glfwTerminate();
-        return -1;
+        throw std::runtime_error("Failed to create circle shader program");
     }
     
     // Create shader program for net
     unsigned int netVertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
     unsigned int netFragmentShader = compileShader(GL_FRAGMENT_SHADER, netFragmentShaderSource);
-    unsigned int netShaderProgram = 0;
     if (netVertexShader != 0 && netFragmentShader != 0) {
-        netShaderProgram = glCreateProgram();
-        glAttachShader(netShaderProgram, netVertexShader);
-        glAttachShader(netShaderProgram, netFragmentShader);
-        glLinkProgram(netShaderProgram);
+        shaders.netShader = glCreateProgram();
+        glAttachShader(shaders.netShader, netVertexShader);
+        glAttachShader(shaders.netShader, netFragmentShader);
+        glLinkProgram(shaders.netShader);
         
         int success;
         char infoLog[512];
-        glGetProgramiv(netShaderProgram, GL_LINK_STATUS, &success);
+        glGetProgramiv(shaders.netShader, GL_LINK_STATUS, &success);
         if (!success) {
-            glGetProgramInfoLog(netShaderProgram, 512, NULL, infoLog);
+            glGetProgramInfoLog(shaders.netShader, 512, NULL, infoLog);
             std::cerr << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
-            netShaderProgram = 0;
+            shaders.netShader = 0;
         }
         glDeleteShader(netVertexShader);
         glDeleteShader(netFragmentShader);
     }
     
-    if (netShaderProgram == 0) {
+    if (shaders.netShader == 0) {
         std::cerr << "Failed to create net shader program" << std::endl;
         glfwTerminate();
-        return -1;
+        throw std::runtime_error("Failed to create net shader program");
     }
     
     // Create shader program for air particles
     unsigned int airVertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
     unsigned int airFragmentShader = compileShader(GL_FRAGMENT_SHADER, airParticleFragmentShaderSource);
-    unsigned int airParticleShaderProgram = 0;
     if (airVertexShader != 0 && airFragmentShader != 0) {
-        airParticleShaderProgram = glCreateProgram();
-        glAttachShader(airParticleShaderProgram, airVertexShader);
-        glAttachShader(airParticleShaderProgram, airFragmentShader);
-        glLinkProgram(airParticleShaderProgram);
+        shaders.airParticleShader = glCreateProgram();
+        glAttachShader(shaders.airParticleShader, airVertexShader);
+        glAttachShader(shaders.airParticleShader, airFragmentShader);
+        glLinkProgram(shaders.airParticleShader);
         
         int success;
         char infoLog[512];
-        glGetProgramiv(airParticleShaderProgram, GL_LINK_STATUS, &success);
+        glGetProgramiv(shaders.airParticleShader, GL_LINK_STATUS, &success);
         if (!success) {
-            glGetProgramInfoLog(airParticleShaderProgram, 512, NULL, infoLog);
+            glGetProgramInfoLog(shaders.airParticleShader, 512, NULL, infoLog);
             std::cerr << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
-            airParticleShaderProgram = 0;
+            shaders.airParticleShader = 0;
         }
         glDeleteShader(airVertexShader);
         glDeleteShader(airFragmentShader);
     }
     
-    if (airParticleShaderProgram == 0) {
+    if (shaders.airParticleShader == 0) {
         std::cerr << "Failed to create air particle shader program" << std::endl;
         glfwTerminate();
-        return -1;
+        throw std::runtime_error("Failed to create air particle shader program");
     }
 
     // Optionally create shader program for the path trace (thin red line)
-    unsigned int pathShaderProgram = 0;
     if (showPath) {
         unsigned int pathVertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
         unsigned int pathFragmentShader = compileShader(GL_FRAGMENT_SHADER, pathFragmentShaderSource);
         if (pathVertexShader != 0 && pathFragmentShader != 0) {
-            pathShaderProgram = glCreateProgram();
-            glAttachShader(pathShaderProgram, pathVertexShader);
-            glAttachShader(pathShaderProgram, pathFragmentShader);
-            glLinkProgram(pathShaderProgram);
+            shaders.pathShader = glCreateProgram();
+            glAttachShader(shaders.pathShader, pathVertexShader);
+            glAttachShader(shaders.pathShader, pathFragmentShader);
+            glLinkProgram(shaders.pathShader);
 
             int success;
             char infoLog[512];
-            glGetProgramiv(pathShaderProgram, GL_LINK_STATUS, &success);
+            glGetProgramiv(shaders.pathShader, GL_LINK_STATUS, &success);
             if (!success) {
-                glGetProgramInfoLog(pathShaderProgram, 512, NULL, infoLog);
+                glGetProgramInfoLog(shaders.pathShader, 512, NULL, infoLog);
                 std::cerr << "WARNING: path shader linking failed; disabling path trace\n" << infoLog << std::endl;
-                glDeleteProgram(pathShaderProgram);
-                pathShaderProgram = 0;
+                glDeleteProgram(shaders.pathShader);
+                shaders.pathShader = 0;
                 showPath = false;
             }
             glDeleteShader(pathVertexShader);
@@ -532,6 +523,45 @@ int main(int argc, char** argv) {
             showPath = false;
         }
     }
+
+    return window;
+}
+
+// Cleanup function to delete shaders and terminate GLFW
+void cleanup(GLFWwindow* window, WorldShaders &shaders) {
+    // Delete shader programs
+    glDeleteProgram(shaders.rectangleShader);
+    glDeleteProgram(shaders.circleShader);
+    glDeleteProgram(shaders.netShader);
+    glDeleteProgram(shaders.airParticleShader);
+    if (shaders.pathShader != 0) {
+        glDeleteProgram(shaders.pathShader);
+    }
+    
+    // Terminate GLFW
+    glfwDestroyWindow(window);
+    glfwTerminate();
+}
+
+int main(int argc, char** argv) {
+    // Parse command-line arguments
+    bool showPath = false; // off by default
+    bool use_cuda_requested = false;
+    for (int ai = 1; ai < argc; ++ai) {
+        if (std::strcmp(argv[ai], "--trace-path") == 0 || std::strcmp(argv[ai], "-t") == 0 || std::strcmp(argv[ai], "--path") == 0) {
+            showPath = true;
+            break;
+        }
+        if (std::strcmp(argv[ai], "--use-cuda") == 0 || std::strcmp(argv[ai], "--cuda") == 0) {
+            use_cuda_requested = true;
+        }
+    }
+    // Quick sanity write to stderr so we can verify logging is captured
+    std::cerr << "TIMING: program_start" << std::endl;
+
+    // Initialize OpenGL and create window
+    WorldShaders shaders;
+    GLFWwindow* window = gl_init(showPath, shaders);
     
     // config: world physical size (meters)
     const float WORLD_W = 13.4112f; // length (m)
@@ -969,28 +999,28 @@ int main(int argc, char** argv) {
         
             // Render a rectangle at the center of the screen (the court)
             // Convert world meters -> NDC using uniform scale so the whole court fits
-            glUseProgram(shaderProgram);
+            glUseProgram(shaders.rectangleShader);
             float rect_w_ndc = WORLD_W * NDC_SCALE;
             float rect_h_ndc = WORLD_H * NDC_SCALE;
             renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
             
             // Render the net splitting the court in half (vertical line at x=0)
-            glUseProgram(netShaderProgram);
+            glUseProgram(shaders.netShader);
             renderNet(world_to_ndc_x(0.0f), world_to_ndc_y(rectHalfHeight), world_to_ndc_y(-rectHalfHeight), world_to_ndc_scale(0.01f));
             
             // Render air particles (now moving, small circles)
-            glUseProgram(airParticleShaderProgram);
+            glUseProgram(shaders.airParticleShader);
             for (size_t i = 0; i < airParticles.size(); i++) {
                 renderCircle(world_to_ndc_x(airParticles[i].x), world_to_ndc_y(airParticles[i].y), world_to_ndc_scale(airParticleRadius), 16);
             }
 
             // Render a circle (ball) inside the rectangle at its current position
-            glUseProgram(circleShaderProgram);
+            glUseProgram(shaders.circleShader);
             renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(circleRadius), 32);
 
             // Render the ball path as a thin red line (GL_LINE_STRIP) if enabled
-            if (showPath && ballPath.size() >= 2 && pathShaderProgram != 0) {
-                glUseProgram(pathShaderProgram);
+            if (showPath && ballPath.size() >= 2 && shaders.pathShader != 0) {
+                glUseProgram(shaders.pathShader);
                 std::vector<float> pathVerts;
                 pathVerts.reserve(ballPath.size() * 2);
                 for (const auto &pt : ballPath) {
@@ -1066,12 +1096,7 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
-    glDeleteProgram(shaderProgram);
-    glDeleteProgram(circleShaderProgram);
-    glDeleteProgram(netShaderProgram);
-    glDeleteProgram(airParticleShaderProgram);
-    if (pathShaderProgram != 0) glDeleteProgram(pathShaderProgram);
-    glfwTerminate();
+    cleanup(window, shaders);
     
     return 0;
 
