@@ -80,6 +80,42 @@ const char* pathFragmentShaderSource =
 "    FragColor = vec4(0.9f, 0.1f, 0.1f, 1.0f);\n"
 "}\n"
 ;
+
+// ******** Some world constants ********
+// config: world physical size (meters)
+const float WORLD_W = 13.4112f; // length (m)
+const float WORLD_H = 6.096f;   // width (m)
+const float world_cx = 0.0f, world_cy = 0.0f;
+// Uniform NDC scale to preserve aspect (use same scale on X and Y)
+const float NDC_SCALE = std::min(2.0f / WORLD_W, 2.0f / WORLD_H);
+// Rectangle boundaries (half width and half height) in world meters
+float rectHalfWidth = WORLD_W * 0.5f; // half-length
+float rectHalfHeight = WORLD_H * 0.5f;   // half-width
+
+// Generate air particles (now with velocities for collision response)
+const int numAirParticles = 3000;
+
+// Physics constants
+const float BALL_MASS = 0.026f;  // kg (26g)
+const float AIR_PARCEL_MASS = 0.0001f;  // kg (0.1g) - represents many air molecules
+const float BALL_RADIUS = 0.185f;
+const float BALL_MOMENT_OF_INERTIA = (2.0f / 5.0f) * BALL_MASS * BALL_RADIUS * BALL_RADIUS;
+
+float airParticleRadius = 0.005f;
+
+const float IMPULSE_SCALE_FACTOR = 1;  // Can scale down impulses
+const float AIR_AIR_IMPULSE_SCALE_FACTOR = 0.1f;
+
+// Wind parameters (wind velocity in m/s)
+// Set these to non-zero values to simulate wind
+// For still air, set both to 0.0f
+const float WIND_VELOCITY_X = 0.0f;  // Wind speed in x direction (m/s)
+const float WIND_VELOCITY_Y = 0.0f;  // Wind speed in y direction (m/s)
+// Wind turbulence: small random variations in wind speed
+const float WIND_TURBULENCE = 0.1f;  // Random variation as fraction of wind speed
+// **************************************    
+
+
 // Function to compile shader
 unsigned int compileShader(unsigned int type, const char* source) {
     unsigned int shader = glCreateShader(type);
@@ -563,14 +599,7 @@ int main(int argc, char** argv) {
     WorldShaders shaders;
     GLFWwindow* window = gl_init(showPath, shaders);
     
-    // config: world physical size (meters)
-    const float WORLD_W = 13.4112f; // length (m)
-    const float WORLD_H = 6.096f;   // width (m)
-    const float world_cx = 0.0f, world_cy = 0.0f;
-
-    // Uniform NDC scale to preserve aspect (use same scale on X and Y)
-    const float NDC_SCALE = std::min(2.0f / WORLD_W, 2.0f / WORLD_H);
-
+    // World to NDC conversion lambdas
     auto world_to_ndc_x = [&](float x){
         return (x - world_cx) * NDC_SCALE;
     };
@@ -580,32 +609,6 @@ int main(int argc, char** argv) {
     auto world_to_ndc_scale = [&](float s){
         return s * NDC_SCALE;
     };
-    
-    // Rectangle boundaries (half width and half height) in world meters
-    float rectHalfWidth = WORLD_W * 0.5f; // half-length
-    float rectHalfHeight = WORLD_H * 0.5f;   // half-width
-    
-    // Generate air particles (now with velocities for collision response)
-    const int numAirParticles = 3000;
-    
-    // Physics constants
-    const float BALL_MASS = 0.026f;  // kg (26g)
-    const float AIR_PARCEL_MASS = 0.0001f;  // kg (0.1g) - represents many air molecules
-    const float BALL_RADIUS = 0.185f;
-    const float BALL_MOMENT_OF_INERTIA = (2.0f / 5.0f) * BALL_MASS * BALL_RADIUS * BALL_RADIUS;
-    
-    float airParticleRadius = 0.005f;
-    
-    const float IMPULSE_SCALE_FACTOR = 1;  // Can scale down impulses
-    const float AIR_AIR_IMPULSE_SCALE_FACTOR = 0.1f;
-    
-    // Wind parameters (wind velocity in m/s)
-    // Set these to non-zero values to simulate wind
-    // For still air, set both to 0.0f
-    const float WIND_VELOCITY_X = 0.0f;  // Wind speed in x direction (m/s)
-    const float WIND_VELOCITY_Y = 0.0f;  // Wind speed in y direction (m/s)
-    // Wind turbulence: small random variations in wind speed
-    const float WIND_TURBULENCE = 0.1f;  // Random variation as fraction of wind speed
     
     // Use proper physics constants
     float ballMass = BALL_MASS;
