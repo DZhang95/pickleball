@@ -4,6 +4,12 @@
 #include <cmath>
 #include "cuda_kernels.h"
 
+// Helper to print CUDA errors with context
+static inline void printCudaError(const char *where, cudaError_t err) {
+    if (err == cudaSuccess) return;
+    fprintf(stderr, "CUDA ERROR at %s: %s (code=%d)\n", where, cudaGetErrorString(err), (int)err);
+}
+
 // Duplicate a few physics constants to keep the CUDA code self-contained.
 static const float BALL_MASS_CU = 0.026f;
 static const float AIR_PARCEL_MASS_CU = 0.0001f;
@@ -179,6 +185,23 @@ __global__ void kernel_physics_step(
 }
 
 extern "C" bool cuda_physics_init(int n) {
+    // Quick device availability check
+    int deviceCount = 0;
+    cudaError_t cerr = cudaGetDeviceCount(&deviceCount);
+    if (cerr != cudaSuccess) {
+        printCudaError("cudaGetDeviceCount", cerr);
+        return false;
+    }
+    if (deviceCount <= 0) {
+        fprintf(stderr, "CUDA INFO: no CUDA devices found (deviceCount=%d)\n", deviceCount);
+        return false;
+    }
+    // Use device 0 by default
+    cerr = cudaSetDevice(0);
+    if (cerr != cudaSuccess) {
+        printCudaError("cudaSetDevice(0)", cerr);
+        return false;
+    }
     if (n <= 0) return false;
     if (g_n >= n && g_px && g_py && g_pvx && g_pvy) {
         return true;
@@ -193,34 +216,51 @@ extern "C" bool cuda_physics_init(int n) {
     if (g_impulse_y) cudaFree(g_impulse_y);
     if (g_spin_accum) cudaFree(g_spin_accum);
 
-    if (cudaMalloc((void**)&g_px, sizeof(float) * n) != cudaSuccess) return false;
-    if (cudaMalloc((void**)&g_py, sizeof(float) * n) != cudaSuccess) { cudaFree(g_px); g_px = nullptr; return false; }
-    if (cudaMalloc((void**)&g_pvx, sizeof(float) * n) != cudaSuccess) { cudaFree(g_px); cudaFree(g_py); g_px = g_py = nullptr; return false; }
-    if (cudaMalloc((void**)&g_pvy, sizeof(float) * n) != cudaSuccess) { cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); g_px = g_py = g_pvx = nullptr; return false; }
+    cudaError_t err = cudaMalloc((void**)&g_px, sizeof(float) * n);
+    if (err != cudaSuccess) { printCudaError("cudaMalloc g_px", err); return false; }
+    err = cudaMalloc((void**)&g_py, sizeof(float) * n);
+    if (err != cudaSuccess) { printCudaError("cudaMalloc g_py", err); cudaFree(g_px); g_px = nullptr; return false; }
+    err = cudaMalloc((void**)&g_pvx, sizeof(float) * n);
+    if (err != cudaSuccess) { printCudaError("cudaMalloc g_pvx", err); cudaFree(g_px); cudaFree(g_py); g_px = g_py = nullptr; return false; }
+    err = cudaMalloc((void**)&g_pvy, sizeof(float) * n);
+    if (err != cudaSuccess) { printCudaError("cudaMalloc g_pvy", err); cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); g_px = g_py = g_pvx = nullptr; return false; }
 
-    if (cudaMalloc((void**)&g_impulse_x, sizeof(float)) != cudaSuccess) { cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); cudaFree(g_pvy); return false; }
-    if (cudaMalloc((void**)&g_impulse_y, sizeof(float)) != cudaSuccess) { cudaFree(g_impulse_x); cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); cudaFree(g_pvy); return false; }
-    if (cudaMalloc((void**)&g_spin_accum, sizeof(float)) != cudaSuccess) { cudaFree(g_impulse_y); cudaFree(g_impulse_x); cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); cudaFree(g_pvy); return false; }
+    err = cudaMalloc((void**)&g_impulse_x, sizeof(float));
+    if (err != cudaSuccess) { printCudaError("cudaMalloc g_impulse_x", err); cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); cudaFree(g_pvy); return false; }
+    err = cudaMalloc((void**)&g_impulse_y, sizeof(float));
+    if (err != cudaSuccess) { printCudaError("cudaMalloc g_impulse_y", err); cudaFree(g_impulse_x); cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); cudaFree(g_pvy); return false; }
+    err = cudaMalloc((void**)&g_spin_accum, sizeof(float));
+    if (err != cudaSuccess) { printCudaError("cudaMalloc g_spin_accum", err); cudaFree(g_impulse_y); cudaFree(g_impulse_x); cudaFree(g_px); cudaFree(g_py); cudaFree(g_pvx); cudaFree(g_pvy); return false; }
 
     g_n = n;
     return true;
 }
 
 extern "C" bool cuda_physics_run(float* px, float* py, float* pvx, float* pvy, int n, float* ballState, float dt) {
-    if (!g_px || !g_py || !g_pvx || !g_pvy || g_n < n) return false;
+    if (!g_px || !g_py || !g_pvx || !g_pvy || g_n < n) {
+        fprintf(stderr, "CUDA RUN: device buffers not initialized or too small (g_n=%d, n=%d)\n", g_n, n);
+        return false;
+    }
     if (n <= 0) return true;
 
     // Copy host arrays to device
-    if (cudaMemcpy(g_px, px, sizeof(float) * n, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (cudaMemcpy(g_py, py, sizeof(float) * n, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (cudaMemcpy(g_pvx, pvx, sizeof(float) * n, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (cudaMemcpy(g_pvy, pvy, sizeof(float) * n, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    cudaError_t err = cudaMemcpy(g_px, px, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_px", err); return false; }
+    err = cudaMemcpy(g_py, py, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_py", err); return false; }
+    err = cudaMemcpy(g_pvx, pvx, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_pvx", err); return false; }
+    err = cudaMemcpy(g_pvy, pvy, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_pvy", err); return false; }
 
     // Zero accumulators
     float zero = 0.0f;
-    if (cudaMemcpy(g_impulse_x, &zero, sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (cudaMemcpy(g_impulse_y, &zero, sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (cudaMemcpy(g_spin_accum, &zero, sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    err = cudaMemcpy(g_impulse_x, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_impulse_x", err); return false; }
+    err = cudaMemcpy(g_impulse_y, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_impulse_y", err); return false; }
+    err = cudaMemcpy(g_spin_accum, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_spin_accum", err); return false; }
 
     // Launch kernel
     const int threads = 256;
@@ -229,20 +269,29 @@ extern "C" bool cuda_physics_run(float* px, float* py, float* pvx, float* pvy, i
     float ballY = ballState[1];
 
     kernel_physics_step<<<blocks, threads>>>(g_px, g_py, g_pvx, g_pvy, n, ballX, ballY, g_impulse_x, g_impulse_y, g_spin_accum, dt);
-    if (cudaPeekAtLastError() != cudaSuccess) return false;
-    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    err = cudaGetLastError();
+    if (err != cudaSuccess) { printCudaError("kernel_physics_step launch", err); return false; }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) { printCudaError("cudaDeviceSynchronize after kernel", err); return false; }
 
     // Copy back particle arrays
-    if (cudaMemcpy(px, g_px, sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (cudaMemcpy(py, g_py, sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (cudaMemcpy(pvx, g_pvx, sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (cudaMemcpy(pvy, g_pvy, sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    err = cudaMemcpy(px, g_px, sizeof(float) * n, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_px", err); return false; }
+    err = cudaMemcpy(py, g_py, sizeof(float) * n, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_py", err); return false; }
+    err = cudaMemcpy(pvx, g_pvx, sizeof(float) * n, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_pvx", err); return false; }
+    err = cudaMemcpy(pvy, g_pvy, sizeof(float) * n, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_pvy", err); return false; }
 
     // Copy back accumulators
     float impx = 0.0f, impy = 0.0f, spin = 0.0f;
-    if (cudaMemcpy(&impx, g_impulse_x, sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (cudaMemcpy(&impy, g_impulse_y, sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (cudaMemcpy(&spin, g_spin_accum, sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    err = cudaMemcpy(&impx, g_impulse_x, sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_impulse_x", err); return false; }
+    err = cudaMemcpy(&impy, g_impulse_y, sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_impulse_y", err); return false; }
+    err = cudaMemcpy(&spin, g_spin_accum, sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_spin_accum", err); return false; }
 
     // Apply accumulators to ball state (host will still add magnus later)
     // ballState layout: [circleX, circleY, circleVelX, circleVelY, circleSpin]

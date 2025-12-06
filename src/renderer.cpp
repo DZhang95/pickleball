@@ -119,7 +119,7 @@ const float timestepSize = 0.001f;  // 0.001s time step
 
 // ******** Other Globals ********
 // Generate air particles
-int numAirParticles = 3000;
+int numAirParticles = 30000;
 // Circle initial position and velocity
 float circleX = -4.0f;
 float circleY = -2.0f;
@@ -658,7 +658,6 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     // If CUDA requested, attempt to run the whole particle-step + ball-particle collisions on GPU.
     // Track whether the GPU actually completed the work successfully (gpu_ok). If it fails
     // we must still perform the CPU ball-particle collision step later.
-    bool gpu_ok = false;
     if (use_cuda_requested) {
         int n = (int)airParticles.size();
         std::vector<float> px(n), py(n), pvx(n), pvy(n);
@@ -674,6 +673,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
 
         bool ok = cuda_physics_run(px.data(), py.data(), pvx.data(), pvy.data(), n, ballState, (float)timestepSize);
         if (ok) {
+            printf("CUDA physics step succeeded with %d particles\n", n);
             // copy back particle arrays
             for (int i = 0; i < n; ++i) {
                 airParticles[i].x = px[i];
@@ -685,15 +685,11 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             circleVelX = ballState[2];
             circleVelY = ballState[3];
             circleSpin = ballState[4];
-            gpu_ok = true;
         } else {
-            // If GPU run failed, fall back to CPU integration for this small step
-            for (size_t i = 0; i < airParticles.size(); i++) {
-                airParticles[i].x += airParticles[i].velX * timestepSize;
-                airParticles[i].y += airParticles[i].velY * timestepSize;
-            }
+            throw std::runtime_error("CUDA physics step failed");
         }
     } else {
+        printf("CUDA physics step not requested; using CPU path\n");
         for (size_t i = 0; i < airParticles.size(); i++) {
             airParticles[i].x += airParticles[i].velX * timestepSize;
             airParticles[i].y += airParticles[i].velY * timestepSize;
@@ -703,7 +699,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     // Check for collisions between air particles (AIR-AIR collisions)
     // If GPU did the physics step successfully (gpu_ok) then the GPU already handled
     // air-air collisions; otherwise run the CPU fallback.
-    if (!use_cuda_requested || !gpu_ok) {
+    if (!use_cuda_requested) {
         for (size_t i = 0; i < airParticles.size(); i++) {
             for (size_t j = i + 1; j < airParticles.size(); j++) {
                 AirParticle& particle1 = airParticles[i];
@@ -750,7 +746,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     // If CUDA was requested and successfully performed the whole physics step (gpu_ok==true)
     // then the GPU already handled ball-particle collisions and we can skip the CPU code.
     // Otherwise (CUDA not requested or GPU run failed), fall back to the CPU collision code.
-    if (!use_cuda_requested || !gpu_ok) {
+    if (!use_cuda_requested) {
         for (size_t i = 0; i < airParticles.size(); i++) {
             AirParticle& particle = airParticles[i];
 
@@ -966,13 +962,36 @@ int main(int argc, char** argv) {
     bool showPath = false; // off by default
     bool use_cuda_requested = false;
     for (int ai = 1; ai < argc; ++ai) {
+        printf("argv[%d] = %s\n", ai, argv[ai]);
         if (std::strcmp(argv[ai], "--trace-path") == 0 || std::strcmp(argv[ai], "-t") == 0 || std::strcmp(argv[ai], "--path") == 0) {
             showPath = true;
-            break;
+            continue;
         }
         if (std::strcmp(argv[ai], "--use-cuda") == 0 || std::strcmp(argv[ai], "--cuda") == 0) {
             use_cuda_requested = true;
+            continue;
         }
+        // New option: allow overriding the number of air particles from the command line
+        if (std::strcmp(argv[ai], "--particle-count") == 0 || std::strcmp(argv[ai], "-p") == 0) {
+            if (ai + 1 < argc) {
+                int requested = std::atoi(argv[++ai]);
+                if (requested <= 0) {
+                    std::cerr << "Invalid --particle-count value '" << argv[ai] << "'; must be > 0. Keeping default of " << numAirParticles << "\n";
+                } else {
+                    // Clamp to a reasonable range to avoid accidental huge allocations
+                    const int MIN_AIR = 0;
+                    const int MAX_AIR = 300000000;
+                    if (requested < MIN_AIR) requested = MIN_AIR;
+                    if (requested > MAX_AIR) requested = MAX_AIR;
+                    numAirParticles = requested;
+                    std::cerr << "Setting numAirParticles to " << numAirParticles << "\n";
+                }
+            } else {
+                std::cerr << "--particle-count requires an integer argument; ignoring" << std::endl;
+            }
+            continue;
+        }
+        // Unknown flags are ignored for now
     }
     // Quick sanity write to stderr so we can verify logging is captured
     std::cerr << "TIMING: program_start" << std::endl;
@@ -998,7 +1017,7 @@ int main(int argc, char** argv) {
     if (use_cuda_requested) {
         if (!cuda_physics_init((int)airParticles.size())) {
             std::cerr << "WARNING: cuda_physics_init failed; disabling CUDA path" << std::endl;
-            use_cuda_requested = false;
+            throw std::runtime_error("cuda_physics_init failed");
         } else {
             std::cerr << "INFO: cuda_physics_init succeeded for n=" << airParticles.size() << std::endl;
         }
