@@ -580,6 +580,42 @@ void cleanup(GLFWwindow* window, WorldShaders &shaders) {
     glfwTerminate();
 }
 
+void initializeAirParticles(std::vector<AirParticle> &airParticles) {
+    // Random number generator for positioning air particles
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> xDist(-rectHalfWidth + airParticleRadius, rectHalfWidth - airParticleRadius);
+    std::uniform_real_distribution<float> yDist(-rectHalfHeight + airParticleRadius, rectHalfHeight - airParticleRadius);
+    
+    // Calculate wind velocity with turbulence
+    float windSpeed = sqrtf(WIND_VELOCITY_X * WIND_VELOCITY_X + WIND_VELOCITY_Y * WIND_VELOCITY_Y);
+    
+    // Generate random positions and velocities for air particles within the court
+    for (int i = 0; i < numAirParticles; i++) {
+        float x = xDist(gen);
+        float y = yDist(gen);
+        
+        // Set initial velocity based on wind
+        float vx, vy;
+        if (windSpeed > 0.0f) {
+            // Wind is present: add wind velocity with some turbulence
+            std::uniform_real_distribution<float> turbDist(-WIND_TURBULENCE, WIND_TURBULENCE);
+            float turbX = turbDist(gen) * windSpeed;
+            float turbY = turbDist(gen) * windSpeed;
+            vx = WIND_VELOCITY_X + turbX;
+            vy = WIND_VELOCITY_Y + turbY;
+        } else {
+            // Still air: particles have near-zero velocity
+            // They only move due to collisions with the ball
+            std::uniform_real_distribution<float> velDist(-0.00001f, 0.00001f);
+            vx = velDist(gen);
+            vy = velDist(gen);
+        }
+        
+        airParticles.push_back(AirParticle(x, y, vx, vy, AIR_PARCEL_MASS));
+    }
+}
+
 int main(int argc, char** argv) {
     // Parse command-line arguments
     bool showPath = false; // off by default
@@ -610,54 +646,14 @@ int main(int argc, char** argv) {
     auto world_to_ndc_scale = [&](float s){
         return s * NDC_SCALE;
     };
-    
-    // Use proper physics constants
-    float ballMass = BALL_MASS;
-    float particleMass = AIR_PARCEL_MASS;
-    float circleRadius = BALL_RADIUS;  // Use actual ball radius
-    
+        
     std::vector<AirParticle> airParticles;
-    
-    // Random number generator for positioning air particles
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> xDist(-rectHalfWidth + airParticleRadius, rectHalfWidth - airParticleRadius);
-    std::uniform_real_distribution<float> yDist(-rectHalfHeight + airParticleRadius, rectHalfHeight - airParticleRadius);
-    
-    // Calculate wind velocity with turbulence
-    float windVx = WIND_VELOCITY_X;
-    float windVy = WIND_VELOCITY_Y;
-    float windSpeed = sqrtf(windVx * windVx + windVy * windVy);
-    
-    // Generate random positions and velocities for air particles within the court
-    for (int i = 0; i < numAirParticles; i++) {
-        float x = xDist(gen);
-        float y = yDist(gen);
-        
-        // Set initial velocity based on wind
-        float vx, vy;
-        if (windSpeed > 0.0f) {
-            // Wind is present: add wind velocity with some turbulence
-            std::uniform_real_distribution<float> turbDist(-WIND_TURBULENCE, WIND_TURBULENCE);
-            float turbX = turbDist(gen) * windSpeed;
-            float turbY = turbDist(gen) * windSpeed;
-            vx = windVx + turbX;
-            vy = windVy + turbY;
-        } else {
-            // Still air: particles have near-zero velocity
-            // They only move due to collisions with the ball
-            std::uniform_real_distribution<float> velDist(-0.00001f, 0.00001f);
-            vx = velDist(gen);
-            vy = velDist(gen);
-        }
-        
-        airParticles.push_back(AirParticle(x, y, vx, vy, particleMass));
-    }
+    initializeAirParticles(airParticles);
     
     // Circle physics variables
     float circleX = -4.0f;
     float circleY = -2.0f;
-    // circleRadius is now set above from BALL_RADIUS
+    // BALL_RADIUS is now set above from BALL_RADIUS
     float circleVelX = 40.0f;  // Velocity in x direction
     float circleVelY = 10.0f;   // Velocity in y direction
     float circleSpin = 100.0f;  // Angular velocity (spin) - scalar in 2D
@@ -810,7 +806,7 @@ int main(int argc, char** argv) {
                 float dx = particle.x - circleX;  // Vector from ball to particle
                 float dy = particle.y - circleY;
                 float distance = sqrtf(dx * dx + dy * dy);
-                float minDistance = circleRadius + airParticleRadius;
+                float minDistance = BALL_RADIUS + airParticleRadius;
                 
                 if (distance < minDistance && distance > 0.0001f) {  // Collision detected
                     // Normalize collision vector (r: from ball center to collision point)
@@ -819,8 +815,8 @@ int main(int argc, char** argv) {
                     float ny = dy / r_mag;
 
                     // r vector with magnitude R (ball radius) pointing to collision point
-                    float rx = nx * circleRadius;
-                    float ry = ny * circleRadius;
+                    float rx = nx * BALL_RADIUS;
+                    float ry = ny * BALL_RADIUS;
 
                     // Separate overlapping objects
                     float overlap = minDistance - distance;
@@ -828,11 +824,11 @@ int main(int argc, char** argv) {
                     float separationY = ny * overlap * 0.5f;
 
                     // Push objects apart (proportional to mass)
-                    float totalMass = ballMass + particle.mass;
+                    float totalMass = BALL_MASS + particle.mass;
                     circleX -= separationX * (particle.mass / totalMass);
                     circleY -= separationY * (particle.mass / totalMass);
-                    particle.x += separationX * (ballMass / totalMass);
-                    particle.y += separationY * (ballMass / totalMass);
+                    particle.x += separationX * (BALL_MASS / totalMass);
+                    particle.y += separationY * (BALL_MASS / totalMass);
 
                     // Calculate surface velocity at point of impact: v_surface = v_ball + (ω × r)
                     // In 2D: ω × r = (-ω * r.y, ω * r.x) where ω is scalar angular velocity
@@ -848,7 +844,7 @@ int main(int argc, char** argv) {
                     float v_rel_n = relVelX * nx + relVelY * ny;
                     if (v_rel_n < 0.0f) { // only apply impulse if bodies are approaching
                         // Effective inverse masses
-                        float invMassBall = 1.0f / ballMass;
+                        float invMassBall = 1.0f / BALL_MASS;
                         float invMassPart = 1.0f / particle.mass;
 
                         // Normal impulse magnitude (restitution e = 0 for inelastic)
@@ -862,7 +858,7 @@ int main(int argc, char** argv) {
                         float v_rel_t = relVelX * tx + relVelY * ty;
 
                         // Denominator for tangential impulse includes rotational coupling: R^2 / I
-                        float denom_t = invMassBall + invMassPart + (circleRadius * circleRadius) / BALL_MOMENT_OF_INERTIA;
+                        float denom_t = invMassBall + invMassPart + (BALL_RADIUS * BALL_RADIUS) / BALL_MOMENT_OF_INERTIA;
                         // Unclamped tangential impulse that would cancel tangential velocity
                         float Jt_unc = - v_rel_t / denom_t;
 
@@ -886,8 +882,8 @@ int main(int argc, char** argv) {
                         impulseY *= IMPULSE_SCALE_FACTOR;
 
                         // Apply linear impulse to ball and particle
-                        circleVelX += impulseX / ballMass;
-                        circleVelY += impulseY / ballMass;
+                        circleVelX += impulseX / BALL_MASS;
+                        circleVelY += impulseY / BALL_MASS;
 
                         // Angular effect from tangential component (normal component gives zero torque because r is radial)
                         float r_cross_J = rx * impulseY - ry * impulseX;
@@ -906,23 +902,23 @@ int main(int argc, char** argv) {
             // If `allowBallEscape` is true we skip bouncing and let the ball leave the world.
             if (!allowBallEscape) {
                 // Left boundary
-                if (circleX - circleRadius <= -rectHalfWidth) {
-                    circleX = -rectHalfWidth + circleRadius;
+                if (circleX - BALL_RADIUS <= -rectHalfWidth) {
+                    circleX = -rectHalfWidth + BALL_RADIUS;
                     circleVelX = -circleVelX;
                 }
                 // Right boundary
-                if (circleX + circleRadius >= rectHalfWidth) {
-                    circleX = rectHalfWidth - circleRadius;
+                if (circleX + BALL_RADIUS >= rectHalfWidth) {
+                    circleX = rectHalfWidth - BALL_RADIUS;
                     circleVelX = -circleVelX;
                 }
                 // Bottom boundary
-                if (circleY - circleRadius <= -rectHalfHeight) {
-                    circleY = -rectHalfHeight + circleRadius;
+                if (circleY - BALL_RADIUS <= -rectHalfHeight) {
+                    circleY = -rectHalfHeight + BALL_RADIUS;
                     circleVelY = -circleVelY;
                 }
                 // Top boundary
-                if (circleY + circleRadius >= rectHalfHeight) {
-                    circleY = rectHalfHeight - circleRadius;
+                if (circleY + BALL_RADIUS >= rectHalfHeight) {
+                    circleY = rectHalfHeight - BALL_RADIUS;
                     circleVelY = -circleVelY;
                 }
             }
@@ -985,8 +981,8 @@ int main(int argc, char** argv) {
                 ScopedTimer timer_magnus("physics_magnus");
                 const float k_magnus = 0.0005f; // tune this constant to change effect strength
                 // Compute magnus acceleration components
-                float magnusAx = k_magnus * (-circleSpin * circleVelY) / ballMass;
-                float magnusAy = k_magnus * ( circleSpin * circleVelX) / ballMass;
+                float magnusAx = k_magnus * (-circleSpin * circleVelY) / BALL_MASS;
+                float magnusAy = k_magnus * ( circleSpin * circleVelX) / BALL_MASS;
                 // Integrate into velocity
                 circleVelX += magnusAx * timestepSize;
                 circleVelY += magnusAy * timestepSize;
@@ -1031,7 +1027,7 @@ int main(int argc, char** argv) {
 
             // Render a circle (ball) inside the rectangle at its current position
             glUseProgram(shaders.circleShader);
-            renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(circleRadius), 32);
+            renderCircle(world_to_ndc_x(circleX), world_to_ndc_y(circleY), world_to_ndc_scale(BALL_RADIUS), 32);
 
             // Render the ball path as a thin red line (GL_LINE_STRIP) if enabled
             if (showPath && ballPath.size() >= 2 && shaders.pathShader != 0) {
@@ -1081,10 +1077,10 @@ int main(int argc, char** argv) {
         // the rectangular world. We consider the ball to have escaped when its
         // entire circle (center +/- radius) lies outside the rectangle on any side.
         if (allowBallEscape) {
-            bool ballOutsideLeft = (circleX + circleRadius < -rectHalfWidth);
-            bool ballOutsideRight = (circleX - circleRadius > rectHalfWidth);
-            bool ballOutsideBottom = (circleY + circleRadius < -rectHalfHeight);
-            bool ballOutsideTop = (circleY - circleRadius > rectHalfHeight);
+            bool ballOutsideLeft = (circleX + BALL_RADIUS < -rectHalfWidth);
+            bool ballOutsideRight = (circleX - BALL_RADIUS > rectHalfWidth);
+            bool ballOutsideBottom = (circleY + BALL_RADIUS < -rectHalfHeight);
+            bool ballOutsideTop = (circleY - BALL_RADIUS > rectHalfHeight);
 
             if (ballOutsideLeft || ballOutsideRight || ballOutsideBottom || ballOutsideTop) {
                 break;
