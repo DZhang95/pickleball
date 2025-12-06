@@ -39,6 +39,7 @@ __global__ void kernel_physics_step(
     float* px, float* py, float* pvx, float* pvy,
     int n,
     float ballX, float ballY,
+    float ballVelX, float ballVelY, float ballSpin,
     float* d_impulse_x, float* d_impulse_y, float* d_spin_accum,
     float dt)
 {
@@ -89,23 +90,28 @@ __global__ void kernel_physics_step(
             float relVelY = vyj - vyi;
             float v_rel_dot_n = relVelX * nx + relVelY * ny;
 
-            // Only apply impulse if there is relative motion along normal
-            // (we don't gate this on sign here to preserve the simpler CPU semantics)
-            float impulseX = 2.0f * AIR_PARCEL_MASS_CU * v_rel_dot_n * nx;
-            float impulseY = 2.0f * AIR_PARCEL_MASS_CU * v_rel_dot_n * ny;
+            // Only apply impulse when particles are moving towards each other.
+            // Use the two-body impulse formula: J = -(1+e) * v_rel_n / (1/m_i + 1/m_j)
+            if (v_rel_dot_n < 0.0f) {
+                const float e = 0.0f; // restitution
+                float invMi = 1.0f / AIR_PARCEL_MASS_CU;
+                float invMj = 1.0f / AIR_PARCEL_MASS_CU;
+                float Jn = -(1.0f + e) * v_rel_dot_n / (invMi + invMj);
+                Jn *= AIR_AIR_IMPULSE_SCALE_FACTOR_CU;
 
-            impulseX *= AIR_AIR_IMPULSE_SCALE_FACTOR_CU;
-            impulseY *= AIR_AIR_IMPULSE_SCALE_FACTOR_CU;
+                float impulseX = Jn * nx;
+                float impulseY = Jn * ny;
 
-            // Apply to particle i (local)
-            vxi += impulseX / AIR_PARCEL_MASS_CU;
-            vyi += impulseY / AIR_PARCEL_MASS_CU;
+                // Apply to particle i (local)
+                vxi += impulseX * invMi;
+                vyi += impulseY * invMi;
 
-            // Apply to particle j (atomic)
-            float delta_vx_j = -impulseX / AIR_PARCEL_MASS_CU;
-            float delta_vy_j = -impulseY / AIR_PARCEL_MASS_CU;
-            atomicAdd(&pvx[j], delta_vx_j);
-            atomicAdd(&pvy[j], delta_vy_j);
+                // Apply to particle j (atomic)
+                float delta_vx_j = -impulseX * invMj;
+                float delta_vy_j = -impulseY * invMj;
+                atomicAdd(&pvx[j], delta_vx_j);
+                atomicAdd(&pvy[j], delta_vy_j);
+            }
         }
     }
 
@@ -122,11 +128,13 @@ __global__ void kernel_physics_step(
         float rx = nx * BALL_RADIUS_CU;
         float ry = ny * BALL_RADIUS_CU;
 
-        float surfaceVelX = 0.0f;
-        float surfaceVelY = 0.0f;
+    // Surface velocity of the ball includes translational velocity and tangential
+    // component from spin: surfaceVel = ballVel + omega x r (in 2D simplified)
+    float surfaceVelX = ballVelX - ballSpin * ry;
+    float surfaceVelY = ballVelY + ballSpin * rx;
 
-        float relVelX = vxi - surfaceVelX;
-        float relVelY = vyi - surfaceVelY;
+    float relVelX = vxi - surfaceVelX;
+    float relVelY = vyi - surfaceVelY;
 
         float v_rel_n = relVelX * nx + relVelY * ny;
         if (v_rel_n < 0.0f) {
@@ -157,9 +165,9 @@ __global__ void kernel_physics_step(
             impulseX *= IMPULSE_SCALE_FACTOR_CU;
             impulseY *= IMPULSE_SCALE_FACTOR_CU;
 
-            // Update particle velocity
-            vxi -= impulseX / AIR_PARCEL_MASS_CU;
-            vyi -= impulseY / AIR_PARCEL_MASS_CU;
+            // Update particle velocity: particle should be pushed AWAY from the ball (+J/m)
+            vxi += impulseX / AIR_PARCEL_MASS_CU;
+            vyi += impulseY / AIR_PARCEL_MASS_CU;
 
             // small separation
             float overlap = ballMinDistance - distb;
@@ -171,9 +179,11 @@ __global__ void kernel_physics_step(
             float r_cross_J = rx * impulseY - ry * impulseX;
             float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA_CU;
 
-            atomicAdd(d_impulse_x, impulseX);
-            atomicAdd(d_impulse_y, impulseY);
-            atomicAdd(d_spin_accum, spin_change);
+            // Accumulate negative impulse and spin for the ball (host will add these accumulators)
+            // We store -J so that the host-side addition results in applying -J to the ball.
+            atomicAdd(d_impulse_x, -impulseX);
+            atomicAdd(d_impulse_y, -impulseY);
+            atomicAdd(d_spin_accum, -spin_change);
         }
     }
 
@@ -267,8 +277,11 @@ extern "C" bool cuda_physics_run(float* px, float* py, float* pvx, float* pvy, i
     int blocks = (n + threads - 1) / threads;
     float ballX = ballState[0];
     float ballY = ballState[1];
+    float ballVelX = ballState[2];
+    float ballVelY = ballState[3];
+    float ballSpin = ballState[4];
 
-    kernel_physics_step<<<blocks, threads>>>(g_px, g_py, g_pvx, g_pvy, n, ballX, ballY, g_impulse_x, g_impulse_y, g_spin_accum, dt);
+    kernel_physics_step<<<blocks, threads>>>(g_px, g_py, g_pvx, g_pvy, n, ballX, ballY, ballVelX, ballVelY, ballSpin, g_impulse_x, g_impulse_y, g_spin_accum, dt);
     err = cudaGetLastError();
     if (err != cudaSuccess) { printCudaError("kernel_physics_step launch", err); return false; }
     err = cudaDeviceSynchronize();
@@ -292,6 +305,9 @@ extern "C" bool cuda_physics_run(float* px, float* py, float* pvx, float* pvy, i
     if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_impulse_y", err); return false; }
     err = cudaMemcpy(&spin, g_spin_accum, sizeof(float), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_spin_accum", err); return false; }
+
+    // Diagnostic print: show accumulated impulse and spin change from kernel
+    fprintf(stderr, "CUDA accumulators: impx=%f, impy=%f, dspin=%f\n", impx, impy, spin);
 
     // Apply accumulators to ball state (host will still add magnus later)
     // ballState layout: [circleX, circleY, circleVelX, circleVelY, circleSpin]

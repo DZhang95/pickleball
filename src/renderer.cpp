@@ -727,16 +727,23 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
                     float relVelY = particle2.velY - particle1.velY;
 
                     float v_rel_dot_n = relVelX * nx + relVelY * ny;
-                    float impulseX = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * nx;
-                    float impulseY = 2.0f * AIR_PARCEL_MASS * v_rel_dot_n * ny;
+                    // Only apply an impulse when particles are moving towards each other.
+                    // Use the two-body impulse formula: J = -(1+e) * v_rel_n / (1/m1 + 1/m2)
+                    if (v_rel_dot_n < 0.0f) {
+                        const float e = 0.0f; // restitution (0 = inelastic)
+                        float invM1 = 1.0f / particle1.mass;
+                        float invM2 = 1.0f / particle2.mass;
+                        float Jn = -(1.0f + e) * v_rel_dot_n / (invM1 + invM2);
+                        Jn *= AIR_AIR_IMPULSE_SCALE_FACTOR; // preserve existing tuning
 
-                    impulseX *= AIR_AIR_IMPULSE_SCALE_FACTOR;
-                    impulseY *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+                        float impulseX = Jn * nx;
+                        float impulseY = Jn * ny;
 
-                    particle1.velX += impulseX / AIR_PARCEL_MASS;
-                    particle1.velY += impulseY / AIR_PARCEL_MASS;
-                    particle2.velX -= impulseX / AIR_PARCEL_MASS;
-                    particle2.velY -= impulseY / AIR_PARCEL_MASS;
+                        particle1.velX += impulseX * invM1;
+                        particle1.velY += impulseY * invM1;
+                        particle2.velX -= impulseX * invM2;
+                        particle2.velY -= impulseY * invM2;
+                    }
                 }
             }
         }
@@ -808,16 +815,20 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
                     impulseX *= IMPULSE_SCALE_FACTOR;
                     impulseY *= IMPULSE_SCALE_FACTOR;
 
-                    circleVelX += impulseX / BALL_MASS;
-                    circleVelY += impulseY / BALL_MASS;
+                    // Apply impulse: ball should be pushed AWAY from the contacting particle.
+                    // Our normal n points from ball -> particle, so the ball receives -J*n
+                    circleVelX -= impulseX / BALL_MASS;
+                    circleVelY -= impulseY / BALL_MASS;
 
                     float r_cross_J = rx * impulseY - ry * impulseX;
                     float spin_change = r_cross_J / BALL_MOMENT_OF_INERTIA;
-                    circleSpin += spin_change;
-                    spinDeltaAccumulator += spin_change;
+                    // Because the ball receives -J, the spin change applied to the ball is -spin_change
+                    circleSpin -= spin_change;
+                    spinDeltaAccumulator -= spin_change;
 
-                    particle.velX -= impulseX / particle.mass;
-                    particle.velY -= impulseY / particle.mass;
+                    // Particle should be pushed away from the ball: particle velocity increases by +J/m
+                    particle.velX += impulseX / particle.mass;
+                    particle.velY += impulseY / particle.mass;
                 }
             }
         }
@@ -879,14 +890,15 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             }
         }
 
-        // Continuous Magnus effect
-        {
-            const float k_magnus = 0.0005f;
-            float magnusAx = k_magnus * (-circleSpin * circleVelY) / BALL_MASS;
-            float magnusAy = k_magnus * ( circleSpin * circleVelX) / BALL_MASS;
-            circleVelX += magnusAx * timestepSize;
-            circleVelY += magnusAy * timestepSize;
-        }
+    }
+
+    // Continuous Magnus effect: apply regardless of whether physics ran on GPU or CPU.
+    {
+        const float k_magnus = 0.0005f;
+        float magnusAx = k_magnus * (-circleSpin * circleVelY) / BALL_MASS;
+        float magnusAy = k_magnus * ( circleSpin * circleVelX) / BALL_MASS;
+        circleVelX += magnusAx * timestepSize;
+        circleVelY += magnusAy * timestepSize;
     }
 }
 
@@ -1025,6 +1037,7 @@ int main(int argc, char** argv) {
     
     // Main render loop
     float timestep = 0.0f;
+    int frame_count = 0;
     while (!glfwWindowShouldClose(window)) {
         ScopedTimer timer_frame("frame_total", timestep);
         // Accumulate spin changes for HUD/debugging this frame
@@ -1070,6 +1083,33 @@ int main(int argc, char** argv) {
         // Swap buffers and poll events
         glfwSwapBuffers(window);
         glfwPollEvents();
+        frame_count++;
+        // Print diagnostics every 10 frames: total kinetic energy, ball speed, and max particle speed
+        if ((frame_count % 10) == 0) {
+            double ke = 0.5 * BALL_MASS * (circleVelX * circleVelX + circleVelY * circleVelY);
+            double maxSpeed = 0.0;
+            int hotCount = 0;
+            for (size_t i = 0; i < airParticles.size(); ++i) {
+                double mvx = airParticles[i].velX;
+                double mvy = airParticles[i].velY;
+                double v2 = mvx * mvx + mvy * mvy;
+                ke += 0.5 * airParticles[i].mass * v2;
+                double speed = sqrt(v2);
+                if (speed > maxSpeed) maxSpeed = speed;
+                if (speed > 1000.0) hotCount++; // implausibly large
+            }
+            double ballSpeed = sqrt(circleVelX * circleVelX + circleVelY * circleVelY);
+            std::cerr << "DEBUG: frame=" << frame_count << " KE=" << ke << " ballSpeed=" << ballSpeed << " maxParticleSpeed=" << maxSpeed << " hotParticles=" << hotCount << "\n";
+
+#ifdef DEBUG
+            // Print total x-momentum (ball + air parcels) to check global momentum conservation
+            double total_px = BALL_MASS * circleVelX;
+            for (size_t i = 0; i < airParticles.size(); ++i) {
+                total_px += (double)airParticles[i].mass * (double)airParticles[i].velX;
+            }
+            std::cerr << "DEBUG_MOM: frame=" << frame_count << " total_px=" << total_px << "\n";
+#endif
+        }
     }
 
     // Print totals before entering the pause/keep-open loop
