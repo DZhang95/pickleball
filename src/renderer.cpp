@@ -1111,9 +1111,17 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
                     instbuf[2*i + 1] = (airParticles[i].y - world_cy) * NDC_SCALE;
                 }
                 glBindBuffer(GL_ARRAY_BUFFER, g_instanceVBO);
-                // Orphan and fill
-                glBufferData(GL_ARRAY_BUFFER, sizeof(float) * instbuf.size(), NULL, GL_DYNAMIC_DRAW);
-                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * instbuf.size(), instbuf.data());
+                size_t bytes = sizeof(float) * instbuf.size();
+                // Try to map the buffer for write to avoid an extra copy and stalls.
+                void* dst = glMapBufferRange(GL_ARRAY_BUFFER, 0, bytes, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+                if (dst) {
+                    memcpy(dst, instbuf.data(), bytes);
+                    glUnmapBuffer(GL_ARRAY_BUFFER);
+                } else {
+                    // Fallback to orphan+subdata
+                    glBufferData(GL_ARRAY_BUFFER, bytes, NULL, GL_DYNAMIC_DRAW);
+                    glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, instbuf.data());
+                }
                 glBindBuffer(GL_ARRAY_BUFFER, 0);
             }
             } else {
@@ -1124,9 +1132,15 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
                 instbuf[2*i + 1] = (airParticles[i].y - world_cy) * NDC_SCALE;
             }
             glBindBuffer(GL_ARRAY_BUFFER, g_instanceVBO);
-            // Orphan and fill
-            glBufferData(GL_ARRAY_BUFFER, sizeof(float) * instbuf.size(), NULL, GL_DYNAMIC_DRAW);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * instbuf.size(), instbuf.data());
+            size_t bytes = sizeof(float) * instbuf.size();
+            void* dst = glMapBufferRange(GL_ARRAY_BUFFER, 0, bytes, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+            if (dst) {
+                memcpy(dst, instbuf.data(), bytes);
+                glUnmapBuffer(GL_ARRAY_BUFFER);
+            } else {
+                glBufferData(GL_ARRAY_BUFFER, bytes, NULL, GL_DYNAMIC_DRAW);
+                glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, instbuf.data());
+            }
             glBindBuffer(GL_ARRAY_BUFFER, 0);
         }
     }
