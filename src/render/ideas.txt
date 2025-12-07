@@ -1,0 +1,12 @@
+Treat shadePixel like a cumulative sum??
+    Doesn't have to write to the image every time, just return the new color given an old color
+
+Even assignment
+find opportunities for shared mem
+each block should operate on neighboring pixels
+partial image accumulated in each block
+
+more info
+    preprocess time?
+
+Don't render pixels that don't need work?

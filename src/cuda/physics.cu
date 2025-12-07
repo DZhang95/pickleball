@@ -332,6 +332,79 @@ extern "C" bool cuda_physics_run(float* px, float* py, float* pvx, float* pvy, i
     return true;
 }
 
+// Device-only variant: runs the physics kernel but does not copy particle arrays back to host.
+// This is useful when the renderer will consume particle positions directly from device memory.
+extern "C" bool cuda_physics_run_device(float* px, float* py, float* pvx, float* pvy, int n, float* ballState, float dt) {
+    if (!g_px || !g_py || !g_pvx || !g_pvy || g_n < n) {
+        fprintf(stderr, "CUDA RUN DEVICE: device buffers not initialized or too small (g_n=%d, n=%d)\n", g_n, n);
+        return false;
+    }
+    if (n <= 0) return true;
+
+    // Copy host arrays to device (we still need to provide initial state)
+    cudaError_t err = cudaMemcpy(g_px, px, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_px", err); return false; }
+    err = cudaMemcpy(g_py, py, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_py", err); return false; }
+    err = cudaMemcpy(g_pvx, pvx, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_pvx", err); return false; }
+    err = cudaMemcpy(g_pvy, pvy, sizeof(float) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_pvy", err); return false; }
+
+    // Zero accumulators
+    float zero = 0.0f;
+    err = cudaMemcpy(g_impulse_x, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_impulse_x", err); return false; }
+    err = cudaMemcpy(g_impulse_y, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_impulse_y", err); return false; }
+    err = cudaMemcpy(g_spin_accum, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy H2D g_spin_accum", err); return false; }
+
+    // Launch kernel
+    const int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    float ballX = ballState[0];
+    float ballY = ballState[1];
+    float ballVelX = ballState[2];
+    float ballVelY = ballState[3];
+    float ballSpin = ballState[4];
+
+    kernel_physics_step<<<blocks, threads>>>(g_px, g_py, g_pvx, g_pvy, n, ballX, ballY, ballVelX, ballVelY, ballSpin, g_impulse_x, g_impulse_y, g_spin_accum, dt);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) { printCudaError("kernel_physics_step launch", err); return false; }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) { printCudaError("cudaDeviceSynchronize after kernel", err); return false; }
+
+    // Copy back accumulators only
+    float impx = 0.0f, impy = 0.0f, spin = 0.0f;
+    err = cudaMemcpy(&impx, g_impulse_x, sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_impulse_x", err); return false; }
+    err = cudaMemcpy(&impy, g_impulse_y, sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_impulse_y", err); return false; }
+    err = cudaMemcpy(&spin, g_spin_accum, sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_spin_accum", err); return false; }
+
+    // Diagnostic print: show accumulated impulse and spin change from kernel
+    fprintf(stderr, "CUDA accumulators (device-only): impx=%f, impy=%f, dspin=%f\n", impx, impy, spin);
+
+    // Apply accumulators to ball state
+    ballState[2] += impx / BALL_MASS_CU;
+    ballState[3] += impy / BALL_MASS_CU;
+    ballState[4] += spin;
+
+    return true;
+}
+
+// Provide access to device buffers for other translation units (non-exported static pointers)
+extern "C" bool cuda_physics_get_device_ptrs(float** out_px, float** out_py, int* out_n) {
+    if (!out_px || !out_py || !out_n) return false;
+    if (!g_px || !g_py || g_n <= 0) return false;
+    *out_px = g_px;
+    *out_py = g_py;
+    *out_n = g_n;
+    return true;
+}
+
 extern "C" void cuda_physics_destroy() {
     if (g_px) { cudaFree(g_px); g_px = nullptr; }
     if (g_py) { cudaFree(g_py); g_py = nullptr; }

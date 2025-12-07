@@ -24,6 +24,11 @@ bool cuda_physics_init(int n);
 // in SoA form (px, py, pvx, pvy). ballState is a float[5] buffer: {circleX, circleY, circleVelX, circleVelY, circleSpin}.
 // On success this updates the particle arrays in-place and writes back updated ballState. Returns true on success.
 bool cuda_physics_run(float* px, float* py, float* pvx, float* pvy, int n, float* ballState, float dt);
+// Device-only run: like cuda_physics_run but does NOT copy particle arrays back to host. Useful when
+// the renderer will consume particle positions directly from device memory.
+bool cuda_physics_run_device(float* px, float* py, float* pvx, float* pvy, int n, float* ballState, float dt);
+// Expose device pointers and current buffer size: returns true and fills out pointers when available.
+bool cuda_physics_get_device_ptrs(float** out_px, float** out_py, int* out_n);
 // destroy: free any persistent buffers
 void cuda_physics_destroy();
 

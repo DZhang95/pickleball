@@ -27,6 +27,8 @@
 
 // Optional CUDA test API (scaffolded). See src/cuda/*
 #include "cuda/cuda_kernels.h"
+// Optional CUDA render helper (stubbed implementation provided in src/cuda/)
+#include "cuda/render_cuda.h"
 
 // Vertex shader source code
 const char* vertexShaderSource = 
@@ -37,6 +39,19 @@ const char* vertexShaderSource =
 "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
 "}\n";
 
+
+// Vertex shader used for instanced particle rendering. It expects:
+//  - location 0: mesh vertex position (unit circle)
+//  - location 1: per-instance center position (in NDC)
+const char* particleVertexShaderSource =
+"#version 330 core\n"
+"layout (location = 0) in vec2 aMeshPos;\n"
+"layout (location = 1) in vec2 aInstancePos;\n"
+"uniform float u_instance_scale;\n"
+"void main() {\n"
+"    vec2 pos = aInstancePos + aMeshPos * u_instance_scale;\n"
+"    gl_Position = vec4(pos, 0.0, 1.0);\n"
+"}\n";
 // Fragment shader source code for rectangle
 const char* fragmentShaderSource = 
 "#version 330 core\n"
@@ -135,6 +150,24 @@ std::vector<std::pair<float,float>> ballPath;
 const size_t maxPathPoints = 5000; // cap to avoid unbounded growth
 // Simulation frame counter for diagnostics
 static int g_simFrame = 0;
+// Instanced rendering globals (particle mesh + instance buffer)
+static unsigned int g_particleVAO = 0;
+static unsigned int g_particleVBO = 0;
+static unsigned int g_instanceVBO = 0;
+static int g_particleSegments = 12; // triangles used for unit-circle mesh
+// When true, renderFrame will call the CUDA rendering path 
+static bool g_use_cuda_strict = false;
+// If true, CUDA is active but OpenGL-CUDA interop failed; fall back to copying
+// particle arrays back to host each frame and use the CPU instanced upload path.
+static bool g_cuda_force_copyback = false;
+// Device->host image fallback resources
+static unsigned int g_cuda_fallback_texture = 0;
+static unsigned int g_fullscreenVAO = 0;
+static unsigned int g_fullscreenVBO = 0;
+static unsigned int g_fullscreenShader = 0;
+static unsigned char* g_host_particle_image = nullptr;
+static int g_host_img_w = 0;
+static int g_host_img_h = 0;
 // **************************************    
 
 // Function to compile shader
@@ -528,7 +561,7 @@ GLFWwindow* gl_init(bool showPath, WorldShaders &shaders) {
     }
     
     // Create shader program for air particles
-    unsigned int airVertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
+    unsigned int airVertexShader = compileShader(GL_VERTEX_SHADER, particleVertexShaderSource);
     unsigned int airFragmentShader = compileShader(GL_FRAGMENT_SHADER, airParticleFragmentShaderSource);
     if (airVertexShader != 0 && airFragmentShader != 0) {
         shaders.airParticleShader = glCreateProgram();
@@ -667,9 +700,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
         }
     }
 
-    // If CUDA requested, attempt to run the whole particle-step + ball-particle collisions on GPU.
-    // Track whether the GPU actually completed the work successfully (gpu_ok). If it fails
-    // we must still perform the CPU ball-particle collision step later.
+#ifdef HAVE_CUDA
     if (use_cuda_requested) {
         int n = (int)airParticles.size();
         std::vector<float> px(n), py(n), pvx(n), pvy(n);
@@ -683,17 +714,29 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
         // ballState: [circleX, circleY, circleVelX, circleVelY, circleSpin]
         float ballState[5] = { circleX, circleY, circleVelX, circleVelY, circleSpin };
 
-        bool ok = cuda_physics_run(px.data(), py.data(), pvx.data(), pvy.data(), n, ballState, (float)timestepSize);
+        bool ok = false;
+        if (g_cuda_force_copyback) {
+            // Interop unavailable: use the full cuda_physics_run path which copies
+            // particle arrays back to host so the CPU renderer can draw them.
+            ok = cuda_physics_run(px.data(), py.data(), pvx.data(), pvy.data(), n, ballState, (float)timestepSize);
+            if (ok) {
+                // copy back into airParticles
+                for (int i = 0; i < n; ++i) {
+                    airParticles[i].x = px[i];
+                    airParticles[i].y = py[i];
+                    airParticles[i].velX = pvx[i];
+                    airParticles[i].velY = pvy[i];
+                }
+            }
+        } else {
+            // Fast device-only path: keep particle arrays on device and let the
+            // CUDA render helper write instance data directly into the VBO.
+            ok = cuda_physics_run_device(px.data(), py.data(), pvx.data(), pvy.data(), n, ballState, (float)timestepSize);
+        }
+
         if (ok) {
             printf("CUDA physics step succeeded with %d particles\n", n);
-            // copy back particle arrays
-            for (int i = 0; i < n; ++i) {
-                airParticles[i].x = px[i];
-                airParticles[i].y = py[i];
-                airParticles[i].velX = pvx[i];
-                airParticles[i].velY = pvy[i];
-            }
-            // Update ball velocities and spin from returned state (positions are handled on host)
+            // Update ball velocities and spin from returned state
             circleVelX = ballState[2];
             circleVelY = ballState[3];
             circleSpin = ballState[4];
@@ -707,6 +750,18 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             airParticles[i].y += airParticles[i].velY * timestepSize;
         }
     }
+#else
+    if (use_cuda_requested) {
+        std::cerr << "ERROR: binary not built with CUDA support but --use-cuda was requested" << std::endl;
+        throw std::runtime_error("Program not built with CUDA support");
+    } else {
+        printf("CUDA physics step not requested; using CPU path\n");
+        for (size_t i = 0; i < airParticles.size(); i++) {
+            airParticles[i].x += airParticles[i].velX * timestepSize;
+            airParticles[i].y += airParticles[i].velY * timestepSize;
+        }
+    }
+#endif
 
     // Check for collisions between air particles (AIR-AIR collisions)
     // If GPU did the physics step successfully (gpu_ok) then the GPU already handled
@@ -961,7 +1016,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     }
 }
 
-// Rendering function extracted from main loop. Renders the court, net, particles,
+// Renders the court, net, particles,
 // ball and optional path. Uses globals for world-to-NDC constants and ball state.
 void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParticle> &airParticles, double timestep, bool showPath) {
     ScopedTimer timer_render("render_total", timestep);
@@ -986,13 +1041,107 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
         renderNet((0.0f - world_cx) * NDC_SCALE, ( -rectHalfHeight - world_cy) * NDC_SCALE, (rectHalfHeight - world_cy) * NDC_SCALE, net_ndc_width);
     }
 
-    // Render air particles (now moving, small circles)
+    // Render air particles using instanced rendering. We update a per-instance
+    // buffer with particle centers (NDC) and draw the unit-circle mesh instanced.
     glUseProgram(shaders.airParticleShader);
-    for (size_t i = 0; i < airParticles.size(); i++) {
-        float px = (airParticles[i].x - world_cx) * NDC_SCALE;
-        float py = (airParticles[i].y - world_cy) * NDC_SCALE;
-        float pr = airParticleRadius * NDC_SCALE;
-        renderCircle(px, py, pr, 16);
+    int ninstances = (int)airParticles.size();
+    if (ninstances > 0) {
+        // If CUDA render is enabled,
+        // ask the cuda helper to populate the instance VBO from host arrays (or
+        // device arrays in a true CUDA implementation). If the helper reports
+        // failure and the user explicitly requested CUDA rendering, abort.
+#ifdef HAVE_CUDA
+        if (!g_cuda_force_copyback) {
+            // Attempt device-side VBO update (fast path). If it fails we either
+            // abort (strict) or enable the copyback fallback so the CPU path
+            // below will upload instance data from host arrays.
+            bool ok = cuda_render_frame_from_device(ninstances, world_cx, world_cy, NDC_SCALE);
+            if (!ok) {
+                std::cerr << "WARN: CUDA device render update failed" << std::endl;
+                if (g_use_cuda_strict) {
+                    std::cerr << "Aborting because --use-cuda was requested" << std::endl;
+                    throw std::runtime_error("CUDA device render update failed");
+                } else {
+                    std::cerr << "Falling back to device->host copyback render path" << std::endl;
+                    g_cuda_force_copyback = true;
+                }
+            }
+        }
+#else
+        (void)0;
+#endif
+    // Decide whether to run the CPU upload path. It's needed when CUDA is not
+    // available or when we're in the copyback fallback mode.
+#ifdef HAVE_CUDA
+    bool do_cpu_upload = g_cuda_force_copyback;
+#else
+    bool do_cpu_upload = true;
+#endif
+    bool used_image_fallback = false;
+    if (do_cpu_upload) {
+        // If we're in the copyback fallback and have an allocated host image,
+        // attempt the device->host image path (CUDA rasterize -> D2H -> texture upload).
+        if (g_cuda_force_copyback && g_host_particle_image && g_host_img_w > 0 && g_host_img_h > 0) {
+            bool ok = cuda_render_render_to_host(g_host_particle_image, g_host_img_w, g_host_img_h, ninstances, world_cx, world_cy, NDC_SCALE, airParticleRadius);
+            if (ok) {
+                glBindTexture(GL_TEXTURE_2D, g_cuda_fallback_texture);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g_host_img_w, g_host_img_h, GL_RGBA, GL_UNSIGNED_BYTE, g_host_particle_image);
+                glBindTexture(GL_TEXTURE_2D, 0);
+
+                // Draw fullscreen quad with alpha blending over the scene
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glUseProgram(g_fullscreenShader);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, g_cuda_fallback_texture);
+                int loc = glGetUniformLocation(g_fullscreenShader, "u_tex");
+                if (loc >= 0) glUniform1i(loc, 0);
+                glBindVertexArray(g_fullscreenVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                glBindVertexArray(0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glUseProgram(0);
+                    glDisable(GL_BLEND);
+                    used_image_fallback = true;
+            } else {
+                // Image path failed; fall back to CPU instanced upload
+                std::vector<float> instbuf(2 * ninstances);
+                for (int i = 0; i < ninstances; ++i) {
+                    instbuf[2*i + 0] = (airParticles[i].x - world_cx) * NDC_SCALE;
+                    instbuf[2*i + 1] = (airParticles[i].y - world_cy) * NDC_SCALE;
+                }
+                glBindBuffer(GL_ARRAY_BUFFER, g_instanceVBO);
+                // Orphan and fill
+                glBufferData(GL_ARRAY_BUFFER, sizeof(float) * instbuf.size(), NULL, GL_DYNAMIC_DRAW);
+                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * instbuf.size(), instbuf.data());
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+            }
+            } else {
+            // CPU instanced upload path
+            std::vector<float> instbuf(2 * ninstances);
+            for (int i = 0; i < ninstances; ++i) {
+                instbuf[2*i + 0] = (airParticles[i].x - world_cx) * NDC_SCALE;
+                instbuf[2*i + 1] = (airParticles[i].y - world_cy) * NDC_SCALE;
+            }
+            glBindBuffer(GL_ARRAY_BUFFER, g_instanceVBO);
+            // Orphan and fill
+            glBufferData(GL_ARRAY_BUFFER, sizeof(float) * instbuf.size(), NULL, GL_DYNAMIC_DRAW);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * instbuf.size(), instbuf.data());
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        }
+    }
+
+        // Set the instance scale uniform (particle radius in NDC)
+        int loc = glGetUniformLocation(shaders.airParticleShader, "u_instance_scale");
+        if (loc >= 0) glUniform1f(loc, airParticleRadius * NDC_SCALE);
+
+        // Draw instanced unit-circle mesh only when not using the image fallback
+        if (!used_image_fallback) {
+            glBindVertexArray(g_particleVAO);
+            int vertexCount = g_particleSegments * 3; // triangles * 3
+            glDrawArraysInstanced(GL_TRIANGLES, 0, vertexCount, ninstances);
+            glBindVertexArray(0);
+        }
     }
 
     // Render a circle (ball) inside the rectangle at its current position
@@ -1040,6 +1189,12 @@ int main(int argc, char** argv) {
         }
         if (std::strcmp(argv[ai], "--use-cuda") == 0 || std::strcmp(argv[ai], "--cuda") == 0) {
             use_cuda_requested = true;
+            continue;
+        }
+        if (std::strcmp(argv[ai], "--cuda-strict") == 0 || std::strcmp(argv[ai], "--cuda-no-fallback") == 0) {
+            use_cuda_requested = true;
+            g_use_cuda_strict = true;
+            std::cerr << "Enabling strict CUDA mode: abort on registration/update failure" << std::endl;
             continue;
         }
         // New option: allow overriding the number of air particles from the command line
@@ -1112,15 +1267,143 @@ int main(int argc, char** argv) {
         
     std::vector<AirParticle> airParticles;
     initializeAirParticles(airParticles);
-    // If requested, try to initialize CUDA persistent buffers for physics
+    // Create instanced unit-circle mesh and per-instance VBO for particle centers
+    // Mesh: triangles approximating a unit circle (center at 0,0, radius=1)
+    {
+        std::vector<float> meshVerts;
+        meshVerts.reserve(g_particleSegments * 3 * 2);
+        for (int i = 0; i < g_particleSegments; ++i) {
+            // center
+            meshVerts.push_back(0.0f);
+            meshVerts.push_back(0.0f);
+            float angle1 = 2.0f * 3.14159265359f * i / g_particleSegments;
+            float x1 = cosf(angle1);
+            float y1 = sinf(angle1);
+            meshVerts.push_back(x1);
+            meshVerts.push_back(y1);
+            float angle2 = 2.0f * 3.14159265359f * (i + 1) / g_particleSegments;
+            float x2 = cosf(angle2);
+            float y2 = sinf(angle2);
+            meshVerts.push_back(x2);
+            meshVerts.push_back(y2);
+        }
+
+        glGenVertexArrays(1, &g_particleVAO);
+        glBindVertexArray(g_particleVAO);
+
+        glGenBuffers(1, &g_particleVBO);
+        glBindBuffer(GL_ARRAY_BUFFER, g_particleVBO);
+        glBufferData(GL_ARRAY_BUFFER, meshVerts.size() * sizeof(float), meshVerts.data(), GL_STATIC_DRAW);
+        // attribute 0: mesh position (vec2)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        // instance buffer (positions). allocate max space for current particle count
+        glGenBuffers(1, &g_instanceVBO);
+        glBindBuffer(GL_ARRAY_BUFFER, g_instanceVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 2 * (size_t)airParticles.size(), NULL, GL_DYNAMIC_DRAW);
+        // attribute 1: instance center (vec2)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribDivisor(1, 1); // advance per-instance
+
+        // Unbind
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+    }
+
+    // Setup CUDA->host image fallback resources: allocate host image and GL texture.
+    int fbW, fbH;
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    if (fbW > 0 && fbH > 0) {
+        // Try to allocate device offscreen image (best-effort)
+#ifdef HAVE_CUDA
+        if (!cuda_render_alloc_offscreen(fbW, fbH)) {
+            std::cerr << "INFO: cuda_render_alloc_offscreen failed or CUDA unavailable; image fallback will be disabled\n";
+        } else {
+            // Allocate host image buffer
+            size_t sz = (size_t)fbW * (size_t)fbH * 4;
+            g_host_particle_image = (unsigned char*)malloc(sz);
+            g_host_img_w = fbW;
+            g_host_img_h = fbH;
+
+            // Create GL texture for particle image
+            glGenTextures(1, &g_cuda_fallback_texture);
+            glBindTexture(GL_TEXTURE_2D, g_cuda_fallback_texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, fbW, fbH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glBindTexture(GL_TEXTURE_2D, 0);
+
+            // Create simple fullscreen quad for blitting the particle image
+            const float quadVerts[] = {
+                // pos(x,y), uv(u,v)
+                -1.0f, -1.0f, 0.0f, 0.0f,
+                 1.0f, -1.0f, 1.0f, 0.0f,
+                 1.0f,  1.0f, 1.0f, 1.0f,
+                -1.0f, -1.0f, 0.0f, 0.0f,
+                 1.0f,  1.0f, 1.0f, 1.0f,
+                -1.0f,  1.0f, 0.0f, 1.0f
+            };
+            glGenVertexArrays(1, &g_fullscreenVAO);
+            glGenBuffers(1, &g_fullscreenVBO);
+            glBindVertexArray(g_fullscreenVAO);
+            glBindBuffer(GL_ARRAY_BUFFER, g_fullscreenVBO);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindVertexArray(0);
+
+            // Compile fullscreen shader
+            const char* fsqVert = "#version 330 core\nlayout(location=0) in vec2 aPos; layout(location=1) in vec2 aUV; out vec2 vUV; void main(){ vUV = aUV; gl_Position = vec4(aPos,0.0,1.0);}\n";
+            const char* fsqFrag = "#version 330 core\nin vec2 vUV; out vec4 FragColor; uniform sampler2D u_tex; void main(){ vec4 c = texture(u_tex, vUV); FragColor = c; }\n";
+            unsigned int vsh = compileShader(GL_VERTEX_SHADER, fsqVert);
+            unsigned int fsh = compileShader(GL_FRAGMENT_SHADER, fsqFrag);
+            g_fullscreenShader = glCreateProgram();
+            glAttachShader(g_fullscreenShader, vsh);
+            glAttachShader(g_fullscreenShader, fsh);
+            glLinkProgram(g_fullscreenShader);
+            int success;
+            glGetProgramiv(g_fullscreenShader, GL_LINK_STATUS, &success);
+            if (!success) {
+                char infoLog[512]; glGetProgramInfoLog(g_fullscreenShader, 512, NULL, infoLog);
+                std::cerr << "ERROR: fullscreen shader link failed: " << infoLog << std::endl;
+            }
+            glDeleteShader(vsh); glDeleteShader(fsh);
+        }
+#endif
+    }
+
+#ifdef HAVE_CUDA
     if (use_cuda_requested) {
+        if (!cuda_render_register_instance_vbo(g_instanceVBO, (int)airParticles.size())) {
+            std::cerr << "WARN: cuda_render_register_instance_vbo failed; will fall back to device->host copyback render path" << std::endl;
+            // Instead of aborting, enable a safe fallback: the physics kernels will
+            // be used but particle arrays will be copied back to host each frame so
+            // the existing CPU instanced upload path can draw them. This mirrors the
+            // approach used by the separate render project (device->host image/copy).
+            g_cuda_force_copyback = true;
+        } else {
+            std::cerr << "INFO: instance VBO registered with CUDA render helper\n";
+        }
+
         if (!cuda_physics_init((int)airParticles.size())) {
-            std::cerr << "WARNING: cuda_physics_init failed; disabling CUDA path" << std::endl;
+            std::cerr << "ERROR: cuda_physics_init failed" << std::endl;
+            std::cerr << "Aborting because --use-cuda was requested" << std::endl;
             throw std::runtime_error("cuda_physics_init failed");
         } else {
             std::cerr << "INFO: cuda_physics_init succeeded for n=" << airParticles.size() << std::endl;
         }
     }
+#else
+    if (use_cuda_requested) {
+        std::cerr << "ERROR: binary not built with CUDA support but --use-cuda was requested" << std::endl;
+        throw std::runtime_error("Program not built with CUDA support");
+    }
+#endif
     
     // Main render loop
     float timestep = 0.0f;
@@ -1211,8 +1494,22 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
-    // Destroy CUDA persistent buffers if allocated
+#ifdef HAVE_CUDA
+    // Destroy CUDA persistent buffers if allocated and unregister render resources
     if (use_cuda_requested) cuda_physics_destroy();
+    cuda_render_unregister();
+#ifdef HAVE_CUDA
+    // Free image fallback resources
+    cuda_render_free_offscreen();
+    if (g_host_particle_image) { free(g_host_particle_image); g_host_particle_image = nullptr; }
+    if (g_cuda_fallback_texture) { glDeleteTextures(1, &g_cuda_fallback_texture); g_cuda_fallback_texture = 0; }
+    if (g_fullscreenVBO) { glDeleteBuffers(1, &g_fullscreenVBO); g_fullscreenVBO = 0; }
+    if (g_fullscreenVAO) { glDeleteVertexArrays(1, &g_fullscreenVAO); g_fullscreenVAO = 0; }
+    if (g_fullscreenShader) { glDeleteProgram(g_fullscreenShader); g_fullscreenShader = 0; }
+#endif
+#else
+    (void)use_cuda_requested; // silence unused var when CUDA not enabled
+#endif
 
     cleanup(window, shaders);
     
