@@ -321,7 +321,9 @@ extern "C" bool cuda_physics_run(float* px, float* py, float* pvx, float* pvy, i
     if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_spin_accum", err); return false; }
 
     // Diagnostic print: show accumulated impulse and spin change from kernel
+#ifdef DEBUG
     fprintf(stderr, "CUDA accumulators: impx=%f, impy=%f, dspin=%f\n", impx, impy, spin);
+#endif
 
     // Apply accumulators to ball state (host will still add magnus later)
     // ballState layout: [circleX, circleY, circleVelX, circleVelY, circleSpin]
@@ -385,7 +387,9 @@ extern "C" bool cuda_physics_run_device(float* px, float* py, float* pvx, float*
     if (err != cudaSuccess) { printCudaError("cudaMemcpy D2H g_spin_accum", err); return false; }
 
     // Diagnostic print: show accumulated impulse and spin change from kernel
+#ifdef DEBUG
     fprintf(stderr, "CUDA accumulators (device-only): impx=%f, impy=%f, dspin=%f\n", impx, impy, spin);
+#endif
 
     // Apply accumulators to ball state
     ballState[2] += impx / BALL_MASS_CU;

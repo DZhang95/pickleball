@@ -67,8 +67,10 @@ extern "C" bool cuda_vecadd(const float* a, const float* b, float* c, int n) {
         cudaEventElapsedTime(&t_kernel, e_h2d_end, e_kernel_end);
         cudaEventElapsedTime(&t_d2h, e_kernel_end, e_d2h_end);
 
-        std::fprintf(stderr, "CUDA PROFILE n=%d alloc=%.3fms H2D=%.3fms kernel=%.3fms D2H=%.3fms total_gpu_path=%.3fms\n",
-                     n, t_alloc, t_h2d, t_kernel, t_d2h, t_alloc + t_h2d + t_kernel + t_d2h);
+#ifdef DEBUG
+    std::fprintf(stderr, "CUDA PROFILE n=%d alloc=%.3fms H2D=%.3fms kernel=%.3fms D2H=%.3fms total_gpu_path=%.3fms\n",
+             n, t_alloc, t_h2d, t_kernel, t_d2h, t_alloc + t_h2d + t_kernel + t_d2h);
+#endif
 
         cudaEventDestroy(e_alloc_start);
         cudaEventDestroy(e_alloc_end);

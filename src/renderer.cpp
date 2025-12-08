@@ -23,7 +23,7 @@
 #include <fstream>
 
 // Comment out to disable timing info
-#define DEBUG
+//#define DEBUG
 
 // Optional CUDA test API (scaffolded). See src/cuda/*
 #include "cuda/cuda_kernels.h"
@@ -188,13 +188,11 @@ unsigned int compileShader(unsigned int type, const char* source) {
     return shader;
 }
 
-// Timing helpers are enabled only when DEBUG is defined. When disabled we
-// provide small no-op replacements so the rest of the code compiles and runs
-// without the profiling overhead.
-#ifdef DEBUG
+// Timing helpers: always collect totals, but only print per-scope timings in DEBUG mode.
 static std::mutex g_timers_mutex;
 
-// Running totals (ms) and counts per phase
+// Running totals (ms) and counts per phase — always maintained so we can print
+// totals at program end even when DEBUG is not defined.
 static std::map<std::string, double> g_phase_total_ms;
 static std::map<std::string, size_t> g_phase_counts;
 
@@ -203,29 +201,31 @@ struct ScopedTimer {
     double sim_time; // -1 means unavailable
     std::chrono::steady_clock::time_point t0;
 
-    // When created, track the time
     ScopedTimer(const std::string &n, double sim_time_ = -1.0)
       : name(n), sim_time(sim_time_), t0(std::chrono::steady_clock::now()) {}
 
-    // When destroyed, print out the duration
     ~ScopedTimer() {
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::lock_guard<std::mutex> lk(g_timers_mutex);
-        // update running totals and counts
-        g_phase_total_ms[name] += ms;
-        g_phase_counts[name] += 1;
-        // print sim time if available, then phase and ms
+        {
+            std::lock_guard<std::mutex> lk(g_timers_mutex);
+            // update running totals and counts
+            g_phase_total_ms[name] += ms;
+            g_phase_counts[name] += 1;
+        }
+#ifdef DEBUG
+        // In DEBUG builds print per-scope timing lines for live profiling
         if (sim_time >= 0.0) {
             std::cerr << "TS=" << std::fixed << std::setprecision(6) << sim_time
                       << " " << name << " " << ms << " ms" << std::endl;
         } else {
             std::cerr << name << " " << ms << " ms" << std::endl;
         }
+#endif
     }
 };
 
-// Print collected totals (called at end of simulation)
+// Print collected totals (called at end of simulation) — always available.
 static void print_timing_totals() {
     std::lock_guard<std::mutex> lk(g_timers_mutex);
     std::cerr << "==== TIMING TOTALS ====" << std::endl;
@@ -258,14 +258,6 @@ static void print_timing_totals() {
     std::cerr << "physics_subtasks sum: total_ms=" << physics_subsum_ms << std::endl;
     std::cerr << "======================" << std::endl;
 }
-#else
-// No-op versions when DEBUG is not defined
-struct ScopedTimer {
-    ScopedTimer(const std::string & /*n*/, double /*sim_time_*/ = -1.0) {}
-};
-
-static inline void print_timing_totals() {}
-#endif
 
 // Function to create shader program
 unsigned int createShaderProgram() {
@@ -735,7 +727,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
         }
 
         if (ok) {
-            printf("CUDA physics step succeeded with %d particles\n", n);
+            // printf("CUDA physics step succeeded with %d particles\n", n);
             // Update ball velocities and spin from returned state
             circleVelX = ballState[2];
             circleVelY = ballState[3];
@@ -744,7 +736,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             throw std::runtime_error("CUDA physics step failed");
         }
     } else {
-        printf("CUDA physics step not requested; using CPU path\n");
+        // printf("CUDA physics step not requested; using CPU path\n");
         for (size_t i = 0; i < airParticles.size(); i++) {
             airParticles[i].x += airParticles[i].velX * timestepSize;
             airParticles[i].y += airParticles[i].velY * timestepSize;
@@ -755,7 +747,9 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
         std::cerr << "ERROR: binary not built with CUDA support but --use-cuda was requested" << std::endl;
         throw std::runtime_error("Program not built with CUDA support");
     } else {
+#ifdef DEBUG
         printf("CUDA physics step not requested; using CPU path\n");
+#endif
         for (size_t i = 0; i < airParticles.size(); i++) {
             airParticles[i].x += airParticles[i].velX * timestepSize;
             airParticles[i].y += airParticles[i].velY * timestepSize;
@@ -831,11 +825,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     float pre_ball_vy = circleVelY;
     float pre_ball_spin = circleSpin;
 
-    // Diagnostics: count collisions and sum absolute impulse magnitudes
-    int collisionCount = 0;
-    double sumJn = 0.0;
-    int sampleLogged = 0;
-    const int sampleMax = 8;
+    
         for (size_t i = 0; i < airParticles.size(); i++) {
             AirParticle& particle = airParticles[i];
 
@@ -922,15 +912,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
                         // remove the inward component from particle velocity
                         particle.velX -= new_rel_vn * nx;
                         particle.velY -= new_rel_vn * ny;
-                    }
-
-                    // Diagnostics: count and sum magnitudes; sample a few Jn values
-                    collisionCount++;
-                    sumJn += fabs((double)Jn_mag);
-                    if (sampleLogged < sampleMax) {
-                        std::cerr << "DIAG_COLL: frame=" << g_simFrame << " idx=" << i << " Jn=" << Jn_mag << " partMass=" << particle.mass << " v_rel_n=" << v_rel_n << std::endl;
-                        sampleLogged++;
-                    }
+                    }                    
                 }
             }
         }
@@ -945,8 +927,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             spinDeltaAccumulator += (float)acc_ball_spin;
         }        
 
-        // Diagnostics summary for this timestep
-        std::cerr << "DIAG_SUM: frame=" << g_simFrame << " collisions=" << collisionCount << " sumAbsJn=" << sumJn << " acc_imp_x=" << acc_ball_imp_x << " acc_imp_y=" << acc_ball_imp_y << " delta_v_x=" << (acc_ball_imp_x / BALL_MASS) << " delta_v_y=" << (acc_ball_imp_y / BALL_MASS) << std::endl;
+        
         // Check collisions with rectangle boundaries for ball
         if (!allowBallEscape) {
             if (circleX - BALL_RADIUS <= -rectHalfWidth) {
@@ -1057,12 +1038,16 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
             // below will upload instance data from host arrays.
             bool ok = cuda_render_frame_from_device(ninstances, world_cx, world_cy, NDC_SCALE);
             if (!ok) {
+#ifdef DEBUG
                 std::cerr << "WARN: CUDA device render update failed" << std::endl;
+#endif
                 if (g_use_cuda_strict) {
                     std::cerr << "Aborting because --use-cuda was requested" << std::endl;
                     throw std::runtime_error("CUDA device render update failed");
                 } else {
+#ifdef DEBUG
                     std::cerr << "Falling back to device->host copyback render path" << std::endl;
+#endif
                     g_cuda_force_copyback = true;
                 }
             }
@@ -1332,9 +1317,11 @@ int main(int argc, char** argv) {
     if (fbW > 0 && fbH > 0) {
         // Try to allocate device offscreen image (best-effort)
 #ifdef HAVE_CUDA
-        if (!cuda_render_alloc_offscreen(fbW, fbH)) {
-            std::cerr << "INFO: cuda_render_alloc_offscreen failed or CUDA unavailable; image fallback will be disabled\n";
-        } else {
+    if (!cuda_render_alloc_offscreen(fbW, fbH)) {
+#ifdef DEBUG
+        std::cerr << "INFO: cuda_render_alloc_offscreen failed or CUDA unavailable; image fallback will be disabled\n";
+#endif
+    } else {
             // Allocate host image buffer
             size_t sz = (size_t)fbW * (size_t)fbH * 4;
             g_host_particle_image = (unsigned char*)malloc(sz);
@@ -1394,14 +1381,18 @@ int main(int argc, char** argv) {
 #ifdef HAVE_CUDA
     if (use_cuda_requested) {
         if (!cuda_render_register_instance_vbo(g_instanceVBO, (int)airParticles.size())) {
+#ifdef DEBUG
             std::cerr << "WARN: cuda_render_register_instance_vbo failed; will fall back to device->host copyback render path" << std::endl;
+#endif
             // Instead of aborting, enable a safe fallback: the physics kernels will
             // be used but particle arrays will be copied back to host each frame so
             // the existing CPU instanced upload path can draw them. This mirrors the
             // approach used by the separate render project (device->host image/copy).
             g_cuda_force_copyback = true;
         } else {
+#ifdef DEBUG
             std::cerr << "INFO: instance VBO registered with CUDA render helper\n";
+#endif
         }
 
         if (!cuda_physics_init((int)airParticles.size())) {
@@ -1409,7 +1400,9 @@ int main(int argc, char** argv) {
             std::cerr << "Aborting because --use-cuda was requested" << std::endl;
             throw std::runtime_error("cuda_physics_init failed");
         } else {
+#ifdef DEBUG
             std::cerr << "INFO: cuda_physics_init succeeded for n=" << airParticles.size() << std::endl;
+#endif
         }
     }
 #else
@@ -1483,9 +1476,9 @@ int main(int argc, char** argv) {
                 if (speed > 1000.0) hotCount++; // implausibly large
             }
             double ballSpeed = sqrt(circleVelX * circleVelX + circleVelY * circleVelY);
+#ifdef DEBUG
             std::cerr << "DEBUG: frame=" << frame_count << " KE=" << ke << " ballSpeed=" << ballSpeed << " maxParticleSpeed=" << maxSpeed << " hotParticles=" << hotCount << "\n";
 
-#ifdef DEBUG
             // Print total x-momentum (ball + air parcels) to check global momentum conservation
             double total_px = BALL_MASS * circleVelX;
             for (size_t i = 0; i < airParticles.size(); ++i) {
