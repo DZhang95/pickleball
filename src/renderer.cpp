@@ -1042,17 +1042,7 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
     float rect_h_ndc = WORLD_H * NDC_SCALE;
     renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
 
-    // Render the net splitting the court in half (vertical line at x=0)
-    glUseProgram(shaders.netShader);
-    // Draw net with a thickness of ~3 pixels (framebuffer-aware)
-    {
-        int fbW, fbH;
-        glfwGetFramebufferSize(window, &fbW, &fbH);
-        float pixels_per_ndc = (fbW > 0) ? (fbW / 2.0f) : 600.0f;
-        const float desired_pixels = 3.0f;
-        float net_ndc_width = desired_pixels / pixels_per_ndc;
-        renderNet((0.0f - world_cx) * NDC_SCALE, ( -rectHalfHeight - world_cy) * NDC_SCALE, (rectHalfHeight - world_cy) * NDC_SCALE, net_ndc_width);
-    }
+    // Net will be rendered after particles so it appears over them but under the ball.
 
     // Render air particles using instanced rendering. We update a per-instance
     // buffer with particle centers (NDC) and draw the unit-circle mesh instanced.
@@ -1176,6 +1166,20 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
     }
 
     // Render a circle (ball) inside the rectangle at its current position
+    glUseProgram(shaders.circleShader);
+    // Before drawing the ball, draw the net so it appears above particles but
+    // below the ball. Compute a pixel-aware net width similar to earlier code.
+    glUseProgram(shaders.netShader);
+    {
+        int fbW, fbH;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+        float pixels_per_ndc = (fbW > 0) ? (fbW / 2.0f) : 600.0f;
+        const float desired_pixels = 3.0f;
+        float net_ndc_width = desired_pixels / pixels_per_ndc;
+        renderNet((0.0f - world_cx) * NDC_SCALE, ( -rectHalfHeight - world_cy) * NDC_SCALE, (rectHalfHeight - world_cy) * NDC_SCALE, net_ndc_width);
+    }
+
+    // Now draw the ball on top of the net
     glUseProgram(shaders.circleShader);
     renderCircle((circleX - world_cx) * NDC_SCALE, (circleY - world_cy) * NDC_SCALE, BALL_RADIUS * NDC_SCALE, 32);
 
