@@ -161,11 +161,6 @@ static bool g_use_cuda_strict = false;
 // If true, CUDA is active but OpenGL-CUDA interop failed; fall back to copying
 // particle arrays back to host each frame and use the CPU instanced upload path.
 static bool g_cuda_force_copyback = false;
-// If true, allow the CUDA offscreen image -> host copy -> GL texture path.
-// This path is expensive (D2H + glTexSubImage) and can greatly increase
-// render time on systems without proper GPU/driver support. Default to
-// false to prefer the CPU instanced upload path which is usually faster.
-static bool g_enable_cuda_image_fallback = false;
 // Device->host image fallback resources
 static unsigned int g_cuda_fallback_texture = 0;
 static unsigned int g_fullscreenVAO = 0;
@@ -1103,11 +1098,7 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
     if (do_cpu_upload) {
         // If we're in the copyback fallback and have an allocated host image,
         // attempt the device->host image path (CUDA rasterize -> D2H -> texture upload).
-        // This path is disabled by default (see g_enable_cuda_image_fallback) because
-        // it performs a full device->host image copy and a glTexSubImage2D each frame
-        // which can be much slower than the CPU instanced upload, especially on
-        // systems without a GPU-backed GL context.
-        if (g_enable_cuda_image_fallback && g_cuda_force_copyback && g_host_particle_image && g_host_img_w > 0 && g_host_img_h > 0) {
+        if (g_cuda_force_copyback && g_host_particle_image && g_host_img_w > 0 && g_host_img_h > 0) {
             bool ok = cuda_render_render_to_host(g_host_particle_image, g_host_img_w, g_host_img_h, ninstances, world_cx, world_cy, NDC_SCALE, airParticleRadius);
             if (ok) {
                 glBindTexture(GL_TEXTURE_2D, g_cuda_fallback_texture);
