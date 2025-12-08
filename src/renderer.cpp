@@ -21,6 +21,7 @@
 #include <string>
 #include <numeric>
 #include <fstream>
+#include <unordered_map>
 
 // Comment out to disable timing info
 //#define DEBUG
@@ -758,52 +759,83 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
 #endif
 
     // Check for collisions between air particles (AIR-AIR collisions)
-    // If GPU did the physics step successfully (gpu_ok) then the GPU already handled
-    // air-air collisions; otherwise run the CPU fallback.
+    // If GPU did the physics step successfully then the GPU already handled
+    // air-air collisions; otherwise run the CPU fallback. Here we use a
+    // spatial-hash (uniform grid hashed to keys) to reduce work from O(n^2)
+    // to O(n + k) where k is the number of nearby neighbor pairs.
     if (!use_cuda_requested) {
-        for (size_t i = 0; i < airParticles.size(); i++) {
-            for (size_t j = i + 1; j < airParticles.size(); j++) {
-                AirParticle& particle1 = airParticles[i];
-                AirParticle& particle2 = airParticles[j];
+        const float cellSize = 2.0f * airParticleRadius * 1.1f; // slightly larger than interaction radius
+        std::unordered_map<int64_t, std::vector<size_t>> cellMap;
+        cellMap.reserve(airParticles.size() * 2);
 
-                float dx = particle2.x - particle1.x;
-                float dy = particle2.y - particle1.y;
-                float distance = sqrtf(dx * dx + dy * dy);
-                float minDistance = 2.0f * airParticleRadius;
+        auto cell_key = [&](float x, float y) -> int64_t {
+            int cx = (int)std::floor((x + rectHalfWidth) / cellSize);
+            int cy = (int)std::floor((y + rectHalfHeight) / cellSize);
+            return ( (int64_t)cx << 32 ) ^ (uint32_t)cy;
+        };
 
-                if (distance < minDistance && distance > 0.0001f) {
-                    float nx = dx / distance;
-                    float ny = dy / distance;
+        // Build per-cell lists
+        for (size_t i = 0; i < airParticles.size(); ++i) {
+            int64_t key = cell_key(airParticles[i].x, airParticles[i].y);
+            cellMap[key].push_back(i);
+        }
 
-                    float overlap = minDistance - distance;
-                    float separationX = nx * overlap * 0.5f;
-                    float separationY = ny * overlap * 0.5f;
+        // Visit each particle and check neighbors in 3x3 neighboring cells
+        for (size_t i = 0; i < airParticles.size(); ++i) {
+            AirParticle &p1 = airParticles[i];
+            // compute cell coords for p1
+            int base_cx = (int)std::floor((p1.x + rectHalfWidth) / cellSize);
+            int base_cy = (int)std::floor((p1.y + rectHalfHeight) / cellSize);
 
-                    particle1.x -= separationX;
-                    particle1.y -= separationY;
-                    particle2.x += separationX;
-                    particle2.y += separationY;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int64_t neighbor_key = ( (int64_t)(base_cx + dx) << 32 ) ^ (uint32_t)(base_cy + dy);
+                    auto it = cellMap.find(neighbor_key);
+                    if (it == cellMap.end()) continue;
+                    const std::vector<size_t> &cellList = it->second;
+                    for (size_t idx = 0; idx < cellList.size(); ++idx) {
+                        size_t j = cellList[idx];
+                        if (j <= i) continue; // ensure each pair handled once
 
-                    float relVelX = particle2.velX - particle1.velX;
-                    float relVelY = particle2.velY - particle1.velY;
+                        AirParticle &p2 = airParticles[j];
+                        float dx = p2.x - p1.x;
+                        float dy = p2.y - p1.y;
+                        float distance = sqrtf(dx * dx + dy * dy);
+                        float minDistance = 2.0f * airParticleRadius;
 
-                    float v_rel_dot_n = relVelX * nx + relVelY * ny;
-                    // Only apply an impulse when particles are moving towards each other.
-                    // Use the two-body impulse formula: J = -(1+e) * v_rel_n / (1/m1 + 1/m2)
-                    if (v_rel_dot_n < 0.0f) {
-                        const float e = 0.0f; // restitution (0 = inelastic)
-                        float invM1 = 1.0f / particle1.mass;
-                        float invM2 = 1.0f / particle2.mass;
-                        float Jn = -(1.0f + e) * v_rel_dot_n / (invM1 + invM2);
-                        Jn *= AIR_AIR_IMPULSE_SCALE_FACTOR; // preserve existing tuning
+                        if (distance < minDistance && distance > 0.0001f) {
+                            float nx = dx / distance;
+                            float ny = dy / distance;
 
-                        float impulseX = Jn * nx;
-                        float impulseY = Jn * ny;
+                            float overlap = minDistance - distance;
+                            float separationX = nx * overlap * 0.5f;
+                            float separationY = ny * overlap * 0.5f;
 
-                        particle1.velX += impulseX * invM1;
-                        particle1.velY += impulseY * invM1;
-                        particle2.velX -= impulseX * invM2;
-                        particle2.velY -= impulseY * invM2;
+                            p1.x -= separationX;
+                            p1.y -= separationY;
+                            p2.x += separationX;
+                            p2.y += separationY;
+
+                            float relVelX = p2.velX - p1.velX;
+                            float relVelY = p2.velY - p1.velY;
+
+                            float v_rel_dot_n = relVelX * nx + relVelY * ny;
+                            if (v_rel_dot_n < 0.0f) {
+                                const float e = 0.0f;
+                                float invM1 = 1.0f / p1.mass;
+                                float invM2 = 1.0f / p2.mass;
+                                float Jn = -(1.0f + e) * v_rel_dot_n / (invM1 + invM2);
+                                Jn *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+
+                                float impulseX = Jn * nx;
+                                float impulseY = Jn * ny;
+
+                                p1.velX += impulseX * invM1;
+                                p1.velY += impulseY * invM1;
+                                p2.velX -= impulseX * invM2;
+                                p2.velY -= impulseY * invM2;
+                            }
+                        }
                     }
                 }
             }
