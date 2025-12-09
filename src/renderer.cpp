@@ -21,9 +21,10 @@
 #include <string>
 #include <numeric>
 #include <fstream>
+#include <unordered_map>
 
 // Comment out to disable timing info
-#define DEBUG
+//#define DEBUG
 
 // Optional CUDA test API (scaffolded). See src/cuda/*
 #include "cuda/cuda_kernels.h"
@@ -188,13 +189,11 @@ unsigned int compileShader(unsigned int type, const char* source) {
     return shader;
 }
 
-// Timing helpers are enabled only when DEBUG is defined. When disabled we
-// provide small no-op replacements so the rest of the code compiles and runs
-// without the profiling overhead.
-#ifdef DEBUG
+// Timing helpers: always collect totals, but only print per-scope timings in DEBUG mode.
 static std::mutex g_timers_mutex;
 
-// Running totals (ms) and counts per phase
+// Running totals (ms) and counts per phase — always maintained so we can print
+// totals at program end even when DEBUG is not defined.
 static std::map<std::string, double> g_phase_total_ms;
 static std::map<std::string, size_t> g_phase_counts;
 
@@ -203,29 +202,31 @@ struct ScopedTimer {
     double sim_time; // -1 means unavailable
     std::chrono::steady_clock::time_point t0;
 
-    // When created, track the time
     ScopedTimer(const std::string &n, double sim_time_ = -1.0)
       : name(n), sim_time(sim_time_), t0(std::chrono::steady_clock::now()) {}
 
-    // When destroyed, print out the duration
     ~ScopedTimer() {
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::lock_guard<std::mutex> lk(g_timers_mutex);
-        // update running totals and counts
-        g_phase_total_ms[name] += ms;
-        g_phase_counts[name] += 1;
-        // print sim time if available, then phase and ms
+        {
+            std::lock_guard<std::mutex> lk(g_timers_mutex);
+            // update running totals and counts
+            g_phase_total_ms[name] += ms;
+            g_phase_counts[name] += 1;
+        }
+#ifdef DEBUG
+        // In DEBUG builds print per-scope timing lines for live profiling
         if (sim_time >= 0.0) {
             std::cerr << "TS=" << std::fixed << std::setprecision(6) << sim_time
                       << " " << name << " " << ms << " ms" << std::endl;
         } else {
             std::cerr << name << " " << ms << " ms" << std::endl;
         }
+#endif
     }
 };
 
-// Print collected totals (called at end of simulation)
+// Print collected totals (called at end of simulation) — always available.
 static void print_timing_totals() {
     std::lock_guard<std::mutex> lk(g_timers_mutex);
     std::cerr << "==== TIMING TOTALS ====" << std::endl;
@@ -258,14 +259,6 @@ static void print_timing_totals() {
     std::cerr << "physics_subtasks sum: total_ms=" << physics_subsum_ms << std::endl;
     std::cerr << "======================" << std::endl;
 }
-#else
-// No-op versions when DEBUG is not defined
-struct ScopedTimer {
-    ScopedTimer(const std::string & /*n*/, double /*sim_time_*/ = -1.0) {}
-};
-
-static inline void print_timing_totals() {}
-#endif
 
 // Function to create shader program
 unsigned int createShaderProgram() {
@@ -735,7 +728,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
         }
 
         if (ok) {
-            printf("CUDA physics step succeeded with %d particles\n", n);
+            // printf("CUDA physics step succeeded with %d particles\n", n);
             // Update ball velocities and spin from returned state
             circleVelX = ballState[2];
             circleVelY = ballState[3];
@@ -744,7 +737,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             throw std::runtime_error("CUDA physics step failed");
         }
     } else {
-        printf("CUDA physics step not requested; using CPU path\n");
+        // printf("CUDA physics step not requested; using CPU path\n");
         for (size_t i = 0; i < airParticles.size(); i++) {
             airParticles[i].x += airParticles[i].velX * timestepSize;
             airParticles[i].y += airParticles[i].velY * timestepSize;
@@ -755,7 +748,9 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
         std::cerr << "ERROR: binary not built with CUDA support but --use-cuda was requested" << std::endl;
         throw std::runtime_error("Program not built with CUDA support");
     } else {
+#ifdef DEBUG
         printf("CUDA physics step not requested; using CPU path\n");
+#endif
         for (size_t i = 0; i < airParticles.size(); i++) {
             airParticles[i].x += airParticles[i].velX * timestepSize;
             airParticles[i].y += airParticles[i].velY * timestepSize;
@@ -764,52 +759,83 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
 #endif
 
     // Check for collisions between air particles (AIR-AIR collisions)
-    // If GPU did the physics step successfully (gpu_ok) then the GPU already handled
-    // air-air collisions; otherwise run the CPU fallback.
+    // If GPU did the physics step successfully then the GPU already handled
+    // air-air collisions; otherwise run the CPU fallback. Here we use a
+    // spatial-hash (uniform grid hashed to keys) to reduce work from O(n^2)
+    // to O(n + k) where k is the number of nearby neighbor pairs.
     if (!use_cuda_requested) {
-        for (size_t i = 0; i < airParticles.size(); i++) {
-            for (size_t j = i + 1; j < airParticles.size(); j++) {
-                AirParticle& particle1 = airParticles[i];
-                AirParticle& particle2 = airParticles[j];
+        const float cellSize = 2.0f * airParticleRadius * 1.1f; // slightly larger than interaction radius
+        std::unordered_map<int64_t, std::vector<size_t>> cellMap;
+        cellMap.reserve(airParticles.size() * 2);
 
-                float dx = particle2.x - particle1.x;
-                float dy = particle2.y - particle1.y;
-                float distance = sqrtf(dx * dx + dy * dy);
-                float minDistance = 2.0f * airParticleRadius;
+        auto cell_key = [&](float x, float y) -> int64_t {
+            int cx = (int)std::floor((x + rectHalfWidth) / cellSize);
+            int cy = (int)std::floor((y + rectHalfHeight) / cellSize);
+            return ( (int64_t)cx << 32 ) ^ (uint32_t)cy;
+        };
 
-                if (distance < minDistance && distance > 0.0001f) {
-                    float nx = dx / distance;
-                    float ny = dy / distance;
+        // Build per-cell lists
+        for (size_t i = 0; i < airParticles.size(); ++i) {
+            int64_t key = cell_key(airParticles[i].x, airParticles[i].y);
+            cellMap[key].push_back(i);
+        }
 
-                    float overlap = minDistance - distance;
-                    float separationX = nx * overlap * 0.5f;
-                    float separationY = ny * overlap * 0.5f;
+        // Visit each particle and check neighbors in 3x3 neighboring cells
+        for (size_t i = 0; i < airParticles.size(); ++i) {
+            AirParticle &p1 = airParticles[i];
+            // compute cell coords for p1
+            int base_cx = (int)std::floor((p1.x + rectHalfWidth) / cellSize);
+            int base_cy = (int)std::floor((p1.y + rectHalfHeight) / cellSize);
 
-                    particle1.x -= separationX;
-                    particle1.y -= separationY;
-                    particle2.x += separationX;
-                    particle2.y += separationY;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int64_t neighbor_key = ( (int64_t)(base_cx + dx) << 32 ) ^ (uint32_t)(base_cy + dy);
+                    auto it = cellMap.find(neighbor_key);
+                    if (it == cellMap.end()) continue;
+                    const std::vector<size_t> &cellList = it->second;
+                    for (size_t idx = 0; idx < cellList.size(); ++idx) {
+                        size_t j = cellList[idx];
+                        if (j <= i) continue; // ensure each pair handled once
 
-                    float relVelX = particle2.velX - particle1.velX;
-                    float relVelY = particle2.velY - particle1.velY;
+                        AirParticle &p2 = airParticles[j];
+                        float dx = p2.x - p1.x;
+                        float dy = p2.y - p1.y;
+                        float distance = sqrtf(dx * dx + dy * dy);
+                        float minDistance = 2.0f * airParticleRadius;
 
-                    float v_rel_dot_n = relVelX * nx + relVelY * ny;
-                    // Only apply an impulse when particles are moving towards each other.
-                    // Use the two-body impulse formula: J = -(1+e) * v_rel_n / (1/m1 + 1/m2)
-                    if (v_rel_dot_n < 0.0f) {
-                        const float e = 0.0f; // restitution (0 = inelastic)
-                        float invM1 = 1.0f / particle1.mass;
-                        float invM2 = 1.0f / particle2.mass;
-                        float Jn = -(1.0f + e) * v_rel_dot_n / (invM1 + invM2);
-                        Jn *= AIR_AIR_IMPULSE_SCALE_FACTOR; // preserve existing tuning
+                        if (distance < minDistance && distance > 0.0001f) {
+                            float nx = dx / distance;
+                            float ny = dy / distance;
 
-                        float impulseX = Jn * nx;
-                        float impulseY = Jn * ny;
+                            float overlap = minDistance - distance;
+                            float separationX = nx * overlap * 0.5f;
+                            float separationY = ny * overlap * 0.5f;
 
-                        particle1.velX += impulseX * invM1;
-                        particle1.velY += impulseY * invM1;
-                        particle2.velX -= impulseX * invM2;
-                        particle2.velY -= impulseY * invM2;
+                            p1.x -= separationX;
+                            p1.y -= separationY;
+                            p2.x += separationX;
+                            p2.y += separationY;
+
+                            float relVelX = p2.velX - p1.velX;
+                            float relVelY = p2.velY - p1.velY;
+
+                            float v_rel_dot_n = relVelX * nx + relVelY * ny;
+                            if (v_rel_dot_n < 0.0f) {
+                                const float e = 0.0f;
+                                float invM1 = 1.0f / p1.mass;
+                                float invM2 = 1.0f / p2.mass;
+                                float Jn = -(1.0f + e) * v_rel_dot_n / (invM1 + invM2);
+                                Jn *= AIR_AIR_IMPULSE_SCALE_FACTOR;
+
+                                float impulseX = Jn * nx;
+                                float impulseY = Jn * ny;
+
+                                p1.velX += impulseX * invM1;
+                                p1.velY += impulseY * invM1;
+                                p2.velX -= impulseX * invM2;
+                                p2.velY -= impulseY * invM2;
+                            }
+                        }
                     }
                 }
             }
@@ -831,11 +857,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
     float pre_ball_vy = circleVelY;
     float pre_ball_spin = circleSpin;
 
-    // Diagnostics: count collisions and sum absolute impulse magnitudes
-    int collisionCount = 0;
-    double sumJn = 0.0;
-    int sampleLogged = 0;
-    const int sampleMax = 8;
+    
         for (size_t i = 0; i < airParticles.size(); i++) {
             AirParticle& particle = airParticles[i];
 
@@ -922,15 +944,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
                         // remove the inward component from particle velocity
                         particle.velX -= new_rel_vn * nx;
                         particle.velY -= new_rel_vn * ny;
-                    }
-
-                    // Diagnostics: count and sum magnitudes; sample a few Jn values
-                    collisionCount++;
-                    sumJn += fabs((double)Jn_mag);
-                    if (sampleLogged < sampleMax) {
-                        std::cerr << "DIAG_COLL: frame=" << g_simFrame << " idx=" << i << " Jn=" << Jn_mag << " partMass=" << particle.mass << " v_rel_n=" << v_rel_n << std::endl;
-                        sampleLogged++;
-                    }
+                    }                    
                 }
             }
         }
@@ -945,8 +959,7 @@ void simulatePhysics(double timestep, std::vector<AirParticle> &airParticles, bo
             spinDeltaAccumulator += (float)acc_ball_spin;
         }        
 
-        // Diagnostics summary for this timestep
-        std::cerr << "DIAG_SUM: frame=" << g_simFrame << " collisions=" << collisionCount << " sumAbsJn=" << sumJn << " acc_imp_x=" << acc_ball_imp_x << " acc_imp_y=" << acc_ball_imp_y << " delta_v_x=" << (acc_ball_imp_x / BALL_MASS) << " delta_v_y=" << (acc_ball_imp_y / BALL_MASS) << std::endl;
+        
         // Check collisions with rectangle boundaries for ball
         if (!allowBallEscape) {
             if (circleX - BALL_RADIUS <= -rectHalfWidth) {
@@ -1029,17 +1042,7 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
     float rect_h_ndc = WORLD_H * NDC_SCALE;
     renderRectangle(0.0f, 0.0f, rect_w_ndc, rect_h_ndc); // Center in NDC
 
-    // Render the net splitting the court in half (vertical line at x=0)
-    glUseProgram(shaders.netShader);
-    // Draw net with a thickness of ~3 pixels (framebuffer-aware)
-    {
-        int fbW, fbH;
-        glfwGetFramebufferSize(window, &fbW, &fbH);
-        float pixels_per_ndc = (fbW > 0) ? (fbW / 2.0f) : 600.0f;
-        const float desired_pixels = 3.0f;
-        float net_ndc_width = desired_pixels / pixels_per_ndc;
-        renderNet((0.0f - world_cx) * NDC_SCALE, ( -rectHalfHeight - world_cy) * NDC_SCALE, (rectHalfHeight - world_cy) * NDC_SCALE, net_ndc_width);
-    }
+    // Net will be rendered after particles so it appears over them but under the ball.
 
     // Render air particles using instanced rendering. We update a per-instance
     // buffer with particle centers (NDC) and draw the unit-circle mesh instanced.
@@ -1057,12 +1060,16 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
             // below will upload instance data from host arrays.
             bool ok = cuda_render_frame_from_device(ninstances, world_cx, world_cy, NDC_SCALE);
             if (!ok) {
+#ifdef DEBUG
                 std::cerr << "WARN: CUDA device render update failed" << std::endl;
+#endif
                 if (g_use_cuda_strict) {
                     std::cerr << "Aborting because --use-cuda was requested" << std::endl;
                     throw std::runtime_error("CUDA device render update failed");
                 } else {
+#ifdef DEBUG
                     std::cerr << "Falling back to device->host copyback render path" << std::endl;
+#endif
                     g_cuda_force_copyback = true;
                 }
             }
@@ -1159,6 +1166,20 @@ void renderFrame(GLFWwindow* window, WorldShaders &shaders, std::vector<AirParti
     }
 
     // Render a circle (ball) inside the rectangle at its current position
+    glUseProgram(shaders.circleShader);
+    // Before drawing the ball, draw the net so it appears above particles but
+    // below the ball. Compute a pixel-aware net width similar to earlier code.
+    glUseProgram(shaders.netShader);
+    {
+        int fbW, fbH;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+        float pixels_per_ndc = (fbW > 0) ? (fbW / 2.0f) : 600.0f;
+        const float desired_pixels = 3.0f;
+        float net_ndc_width = desired_pixels / pixels_per_ndc;
+        renderNet((0.0f - world_cx) * NDC_SCALE, ( -rectHalfHeight - world_cy) * NDC_SCALE, (rectHalfHeight - world_cy) * NDC_SCALE, net_ndc_width);
+    }
+
+    // Now draw the ball on top of the net
     glUseProgram(shaders.circleShader);
     renderCircle((circleX - world_cx) * NDC_SCALE, (circleY - world_cy) * NDC_SCALE, BALL_RADIUS * NDC_SCALE, 32);
 
@@ -1332,9 +1353,11 @@ int main(int argc, char** argv) {
     if (fbW > 0 && fbH > 0) {
         // Try to allocate device offscreen image (best-effort)
 #ifdef HAVE_CUDA
-        if (!cuda_render_alloc_offscreen(fbW, fbH)) {
-            std::cerr << "INFO: cuda_render_alloc_offscreen failed or CUDA unavailable; image fallback will be disabled\n";
-        } else {
+    if (!cuda_render_alloc_offscreen(fbW, fbH)) {
+#ifdef DEBUG
+        std::cerr << "INFO: cuda_render_alloc_offscreen failed or CUDA unavailable; image fallback will be disabled\n";
+#endif
+    } else {
             // Allocate host image buffer
             size_t sz = (size_t)fbW * (size_t)fbH * 4;
             g_host_particle_image = (unsigned char*)malloc(sz);
@@ -1394,14 +1417,18 @@ int main(int argc, char** argv) {
 #ifdef HAVE_CUDA
     if (use_cuda_requested) {
         if (!cuda_render_register_instance_vbo(g_instanceVBO, (int)airParticles.size())) {
+#ifdef DEBUG
             std::cerr << "WARN: cuda_render_register_instance_vbo failed; will fall back to device->host copyback render path" << std::endl;
+#endif
             // Instead of aborting, enable a safe fallback: the physics kernels will
             // be used but particle arrays will be copied back to host each frame so
             // the existing CPU instanced upload path can draw them. This mirrors the
             // approach used by the separate render project (device->host image/copy).
             g_cuda_force_copyback = true;
         } else {
+#ifdef DEBUG
             std::cerr << "INFO: instance VBO registered with CUDA render helper\n";
+#endif
         }
 
         if (!cuda_physics_init((int)airParticles.size())) {
@@ -1409,7 +1436,9 @@ int main(int argc, char** argv) {
             std::cerr << "Aborting because --use-cuda was requested" << std::endl;
             throw std::runtime_error("cuda_physics_init failed");
         } else {
+#ifdef DEBUG
             std::cerr << "INFO: cuda_physics_init succeeded for n=" << airParticles.size() << std::endl;
+#endif
         }
     }
 #else
@@ -1483,9 +1512,9 @@ int main(int argc, char** argv) {
                 if (speed > 1000.0) hotCount++; // implausibly large
             }
             double ballSpeed = sqrt(circleVelX * circleVelX + circleVelY * circleVelY);
+#ifdef DEBUG
             std::cerr << "DEBUG: frame=" << frame_count << " KE=" << ke << " ballSpeed=" << ballSpeed << " maxParticleSpeed=" << maxSpeed << " hotParticles=" << hotCount << "\n";
 
-#ifdef DEBUG
             // Print total x-momentum (ball + air parcels) to check global momentum conservation
             double total_px = BALL_MASS * circleVelX;
             for (size_t i = 0; i < airParticles.size(); ++i) {
