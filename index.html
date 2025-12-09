@@ -146,6 +146,49 @@
             </p>
         </div>
     </div>
+
+    <!-- Videos Section -->
+    <div class="section-header">
+        <span class="icon">🎥</span>
+        <h2>Project Videos</h2>
+        <span class="icon">🎬</span>
+    </div>
+    
+    <div class="videos-container">
+        <!-- Video 1 -->
+        <div class="video-section">
+            <h3 class="video-title">1 million particles</h3>
+            <div class="video-wrapper">
+                <video id="1M" controls preload="metadata" poster="https://via.placeholder.com/800x450/7eb356/ffffff?text=Pickleball+Flight+Demo">
+                    <source src="1M.mp4" type="video/mp4">
+                    Your browser does not support the video tag.
+                </video>
+            </div>
+            <div class="video-controls">
+                <button class="video-btn" onclick="playPause('1M')">Play/Pause</button>
+                <button class="video-btn" onclick="toggleMute('1M')">Mute/Unmute</button>
+                <button class="video-btn" onclick="toggleFullscreen('1M')">Fullscreen</button>
+                <button class="video-btn" onclick="downloadVideo('1M.mp4')">Download Video</button>
+            </div>
+        </div>
+        
+        <!-- Video 2 -->
+        <div class="video-section">
+            <h3 class="video-title">1 million particles with wind</h3>
+            <div class="video-wrapper">
+                <video id="1M_Wind" controls preload="metadata" poster="https://via.placeholder.com/800x450/4a90e2/ffffff?text=Technical+Overview">
+                    <source src="1M_Wind.mp4" type="video/mp4">
+                    Your browser does not support the video tag.
+                </video>
+            </div>
+            <div class="video-controls">
+                <button class="video-btn" onclick="playPause('1M_Wind')">Play/Pause</button>
+                <button class="video-btn" onclick="toggleMute('1M_Wind')">Mute/Unmute</button>
+                <button class="video-btn" onclick="toggleFullscreen('1M_Wind')">Fullscreen</button>
+                <button class="video-btn" onclick="downloadVideo('1M_Wind.mp4')">Download Video</button>
+            </div>
+        </div>
+    </div>    
     
     <div class="footer">
         Pickleball Flight Project • Last updated: <span id="currentDate"></span>
